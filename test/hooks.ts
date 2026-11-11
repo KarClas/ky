@@ -14,6 +14,10 @@ import ky, {
 import {type Options, type NormalizedOptions} from '../source/types/options.js';
 import {createHttpTestServer} from './helpers/create-http-test-server.js';
 
+// Kept in sync with `missingResponseMessage` in source/core/Ky.ts.
+const noResponseMessage = 'The request resolved without a response, so there is no body to read.'
+	+ ' This happens when a `beforeRetry` hook returns `ky.stop`. Throw from the hook instead of returning `ky.stop`.';
+
 const withHeader = (request: Request, name: string, value: string) => {
 	const headers = new Headers(request.headers);
 	headers.set(name, value);
@@ -339,6 +343,34 @@ test('beforeRetry hook returning a Request-like object still retries after a lat
 	t.is(attempts, 3);
 });
 
+test('ky.retry() accepts a Request-like object tagged as Request and sends it', async t => {
+	const sent: unknown[] = [];
+	let retryRequest: unknown;
+
+	const result = await ky('https://example.com', {
+		retry: {limit: 1, delay: () => 0},
+		async fetch(input) {
+			sent.push(input);
+			return new Response(sent.length === 1 ? 'first' : 'second');
+		},
+		hooks: {
+			afterResponse: [({request, retryCount}) => {
+				if (retryCount > 0) {
+					return undefined;
+				}
+
+				retryRequest = createRequestLike(withHeader(request, 'x-retry', 'yes'));
+				return ky.retry({request: retryRequest as Request});
+			}],
+		},
+	}).text();
+
+	t.is(result, 'second');
+	t.is(sent.length, 2);
+	t.is(sent[1], retryRequest);
+	t.is((sent[1] as Request).headers.get('x-retry'), 'yes');
+});
+
 test('beforeRequest hook allows modifications', async t => {
 	const server = await createHttpTestServer(t);
 	server.post('/', async (request, response) => {
@@ -511,6 +543,69 @@ test('afterResponse hook can read Response-like objects without consuming final 
 	t.is(responseText, 'ok');
 });
 
+test('afterResponse hook can return a Response-like replacement', async t => {
+	let secondHookText: string | undefined;
+
+	const result = await ky('https://example.com', {
+		fetch: async () => new Response('original'),
+		hooks: {
+			afterResponse: [
+				() => createResponseLike(new Response('replacement')),
+				async ({response}) => {
+					secondHookText = await response.text();
+				},
+			],
+		},
+	}).text();
+
+	t.is(result, 'replacement');
+	t.is(secondHookText, 'replacement');
+});
+
+test('afterResponse hook can return a clone of the response it was given', async t => {
+	const chunks = ['first ', 'second ', 'third'];
+
+	const result = await ky('https://example.com', {
+		async fetch() {
+			let index = 0;
+			// Sends one chunk per pull, so cancelling the wrong branch would cut the body short.
+			return new Response(new ReadableStream<Uint8Array>({
+				pull(controller) {
+					const chunk = chunks[index];
+					index++;
+					if (chunk === undefined) {
+						controller.close();
+					} else {
+						controller.enqueue(new TextEncoder().encode(chunk));
+					}
+				},
+			}));
+		},
+		hooks: {
+			afterResponse: [({response}) => response.clone()],
+		},
+	}).text();
+
+	t.is(result, chunks.join(''));
+});
+
+test('onDownloadProgress reports the body of an afterResponse replacement', async t => {
+	const transferredBytes: number[] = [];
+
+	const result = await ky('https://example.com', {
+		fetch: async () => new Response('original body'),
+		onDownloadProgress(progress) {
+			transferredBytes.push(progress.transferredBytes);
+		},
+		hooks: {
+			afterResponse: [() => new Response('replacement')],
+		},
+	}).text();
+
+	t.is(result, 'replacement');
+	t.is(transferredBytes.at(-1), 'replacement'.length);
+});
+
 test('afterResponse hook can wrap the provided body in a new response', async t => {
 	const responseText = await ky('https://example.com', {
 		fetch: async () => new Response('ok', {
@@ -645,6 +740,70 @@ test('afterResponse hook cancels response bodies when it throws', async t => {
 	t.true(originalResponse?.bodyUsed);
 	t.true(clonedResponse?.bodyUsed);
 });
+
+test('afterResponse hook forced retry releases the response body and its clone', async t => {
+	let fetchCount = 0;
+	let didCancel = false;
+
+	const result = await ky('https://example.com', {
+		retry: {limit: 1, delay: () => 0},
+		async fetch() {
+			fetchCount++;
+			if (fetchCount > 1) {
+				return new Response('ok');
+			}
+
+			// The source is only cancelled once both the response and the clone given to the hook are cancelled.
+			return new Response(new ReadableStream({
+				cancel() {
+					didCancel = true;
+				},
+			}));
+		},
+		hooks: {
+			afterResponse: [({retryCount}) => retryCount === 0 ? ky.retry() : undefined],
+		},
+	}).text();
+
+	await delay(0);
+	t.is(result, 'ok');
+	t.is(fetchCount, 2);
+	t.true(didCancel);
+});
+
+for (const outcome of ['returns nothing', 'throws', 'forces a retry'] as const) {
+	test(`afterResponse hook that locks its clone and ${outcome} does not break the request`, async t => {
+		const hookError = new Error('hook failed');
+		let fetchCount = 0;
+
+		const request = ky('https://example.com', {
+			retry: {limit: 1, delay: () => 0},
+			async fetch() {
+				fetchCount++;
+				return new Response('ok');
+			},
+			hooks: {
+				afterResponse: [({response, retryCount}) => {
+					response.body?.getReader();
+
+					if (outcome === 'throws') {
+						throw hookError;
+					}
+
+					return outcome === 'forces a retry' && retryCount === 0 ? ky.retry() : undefined;
+				}],
+			},
+		}).text();
+
+		if (outcome === 'throws') {
+			await t.throwsAsync(request, {is: hookError});
+		} else {
+			t.is(await request, 'ok');
+		}
+
+		t.is(fetchCount, outcome === 'forces a retry' ? 2 : 1);
+	});
+}
 
 test('afterResponse hook accepts failed response', async t => {
 	const server = await createHttpTestServer(t);
@@ -1075,6 +1234,39 @@ test('totalTimeout bounds a never-ending afterResponse hook', async t => {
 
 	t.true(result instanceof TimeoutError);
 	t.true(didAbort);
+});
+
+test('totalTimeout during an afterResponse hook releases the fetched body and the response the hook returns later', async t => {
+	let didHookStart = false;
+	let didCancelFetchedBody = false;
+	let didCancelHookBody = false;
+	const {promise: hookResult, resolve: resolveHook} = Promise.withResolvers<Response>();
+
+	await t.throwsAsync(ky('https://example.com', {
+		totalTimeout: 500,
+		fetch: async () => new Response(new ReadableStream({
+			cancel() {
+				didCancelFetchedBody = true;
+			},
+		})),
+		hooks: {
+			afterResponse: [async () => {
+				didHookStart = true;
+				return hookResult;
+			}],
+		},
+	}).text(), {instanceOf: TimeoutError});
+
+	resolveHook(new Response(new ReadableStream({
+		cancel() {
+			didCancelHookBody = true;
+		},
+	})));
+	await delay(0);
+
+	t.true(didHookStart);
+	t.true(didCancelFetchedBody);
+	t.true(didCancelHookBody);
 });
 
 test('beforeRequest hook runs only once and does not run again on retry', async t => {
@@ -1883,6 +2075,25 @@ test('hooks beforeRequest returning Request then Response skips HTTP request', a
 	t.is(response, expectedResponse);
 });
 
+test('beforeRequest hook returning a Response skips the remaining beforeRequest hooks', async t => {
+	let laterHookCalled = false;
+
+	const result = await ky('https://example.com', {
+		fetch: async () => new Response('fetched'),
+		hooks: {
+			beforeRequest: [
+				() => new Response('cached'),
+				() => {
+					laterHookCalled = true;
+				},
+			],
+		},
+	}).text();
+
+	t.is(result, 'cached');
+	t.false(laterHookCalled);
+});
+
 test('hooks beforeRequest returning Response skips HTTP Request', async t => {
 	const expectedResponse = 'empty hook';
 
@@ -2089,6 +2300,30 @@ test('Ky-specific options are not included in normalized options passed to hooks
 			],
 		},
 	});
+});
+
+test('options passed to afterResponse, beforeRetry, and beforeError hooks are frozen, also after a request replacement', async t => {
+	const frozen: Record<string, boolean[]> = {afterResponse: [], beforeRetry: [], beforeError: []};
+
+	await t.throwsAsync(ky('https://example.com', {
+		retry: {limit: 1, delay: () => 0},
+		fetch: async () => new Response('error', {status: 500}),
+		hooks: {
+			afterResponse: [({options}) => {
+				frozen.afterResponse!.push(Object.isFrozen(options));
+			}],
+			beforeRetry: [({request, options}) => {
+				frozen.beforeRetry!.push(Object.isFrozen(options));
+				return withHeader(request, 'x-retry', '1');
+			}],
+			beforeError: [({options, error}) => {
+				frozen.beforeError!.push(Object.isFrozen(options));
+				return error;
+			}],
+		},
+	}).text(), {instanceOf: HTTPError});
+
+	t.deepEqual(frozen, {afterResponse: [true, true], beforeRetry: [true], beforeError: [true]});
 });
 
 test('afterResponse hook receives retryCount in state parameter', async t => {
@@ -3529,6 +3764,52 @@ test('afterResponse hook forced retry respects retry limit', async t => {
 	);
 
 	t.is(requestCount, 3); // Initial request + 2 retries (limit reached)
+});
+
+test('afterResponse hook sees the retry count of each forced retry', async t => {
+	const retryCounts: number[] = [];
+	let fetchCount = 0;
+
+	const result = await ky('https://example.com', {
+		retry: {limit: 2, delay: () => 0},
+		async fetch() {
+			fetchCount++;
+			return new Response(`attempt ${fetchCount}`);
+		},
+		hooks: {
+			afterResponse: [({retryCount}) => {
+				retryCounts.push(retryCount);
+				return retryCount < 2 ? ky.retry() : undefined;
+			}],
+		},
+	}).text();
+
+	t.is(result, 'attempt 3');
+	t.deepEqual(retryCounts, [0, 1, 2]);
+});
+
+test('beforeRetry returning `ky.stop` after a forced retry resolves without another attempt', async t => {
+	let fetchCount = 0;
+	let afterResponseCount = 0;
+
+	const response = await ky('https://example.com', {
+		retry: {limit: 2, delay: () => 0},
+		async fetch() {
+			fetchCount++;
+			return new Response('ok');
+		},
+		hooks: {
+			afterResponse: [() => {
+				afterResponseCount++;
+				return ky.retry();
+			}],
+			beforeRetry: [() => ky.stop],
+		},
+	});
+
+	t.is(response, undefined);
+	t.is(fetchCount, 1);
+	t.is(afterResponseCount, 1);
 });
 
 test('afterResponse hook forced retry is observable in beforeRetry', async t => {
@@ -5330,6 +5611,185 @@ test('afterResponse force retry on beforeRequest-provided response allows subseq
 	t.is(fetchCallCount, 2);
 });
 
+for (const hook of ['beforeRequest', 'beforeRetry'] as const) {
+	test(`afterResponse hook that makes a ${hook} Response fail throws without retrying`, async t => {
+		let fetchCount = 0;
+		let afterResponseCount = 0;
+
+		const error = await t.throwsAsync<HTTPError>(ky('https://example.com', {
+			retry: {limit: 3, delay: () => 0},
+			async fetch() {
+				fetchCount++;
+				if (hook === 'beforeRetry') {
+					throw new TypeError('fetch failed');
+				}
+
+				return new Response('fetched');
+			},
+			hooks: {
+				[hook]: [() => new Response('cached')],
+				afterResponse: [({response}) => {
+					afterResponseCount++;
+					return response.status === 200 ? new Response('bad', {status: 500}) : undefined;
+				}],
+			},
+		}).text(), {instanceOf: HTTPError});
+
+		t.is(error?.response.status, 500);
+		t.is(fetchCount, hook === 'beforeRequest' ? 0 : 1);
+		t.is(afterResponseCount, 1);
+	});
+
+	test(`a failing Response-like object from ${hook} is not retried`, async t => {
+		let fetchCount = 0;
+		let hookCount = 0;
+
+		const error = await t.throwsAsync<HTTPError>(ky('https://example.com', {
+			retry: {limit: 2, delay: () => 0},
+			async fetch() {
+				fetchCount++;
+				throw new TypeError('fetch failed');
+			},
+			hooks: {
+				[hook]: [() => {
+					hookCount++;
+					return createResponseLike(new Response('nope', {status: 500}));
+				}],
+			},
+		}).text(), {instanceOf: HTTPError});
+
+		t.is(error?.response.status, 500);
+		t.is(fetchCount, hook === 'beforeRequest' ? 0 : 1);
+		t.is(hookCount, 1);
+	});
+}
+
+test('a failing beforeRetry Response reached through a forced retry is not retried again', async t => {
+	let fetchCount = 0;
+	let beforeRetryCount = 0;
+
+	const error = await t.throwsAsync<HTTPError>(ky('https://example.com', {
+		retry: {limit: 3, delay: () => 0},
+		async fetch() {
+			fetchCount++;
+			return new Response('ok');
+		},
+		hooks: {
+			afterResponse: [({retryCount}) => retryCount === 0 ? ky.retry() : undefined],
+			beforeRetry: [() => {
+				beforeRetryCount++;
+				return new Response('nope', {status: 500});
+			}],
+		},
+	}).text(), {instanceOf: HTTPError});
+
+	t.is(error?.response.status, 500);
+	t.is(fetchCount, 1);
+	t.is(beforeRetryCount, 1);
+});
+
+test('a beforeRetry Response does not stop later fetched responses from being retried', async t => {
+	let fetchCount = 0;
+	let usedCache = false;
+	let forcedRetry = false;
+
+	const result = await ky('https://example.com', {
+		retry: {limit: 3, delay: () => 0},
+		async fetch() {
+			fetchCount++;
+			if (fetchCount === 1) {
+				throw new TypeError('fetch failed');
+			}
+
+			return fetchCount === 2 ? new Response('error', {status: 500}) : new Response('fresh');
+		},
+		hooks: {
+			beforeRetry: [() => {
+				if (usedCache) {
+					return undefined;
+				}
+
+				usedCache = true;
+				return new Response('cached');
+			}],
+			afterResponse: [({response}) => {
+				if (forcedRetry || !response.ok) {
+					return undefined;
+				}
+
+				forcedRetry = true;
+				return ky.retry();
+			}],
+		},
+	}).text();
+
+	t.is(result, 'fresh');
+	t.is(fetchCount, 3);
+});
+
+test('a beforeRetry Response counts as a retry for afterResponse and beforeError hooks', async t => {
+	const afterResponseRetryCounts: number[] = [];
+	let beforeErrorRetryCount: number | undefined;
+
+	await t.throwsAsync(ky('https://example.com', {
+		retry: {limit: 2, delay: () => 0},
+		async fetch() {
+			throw new TypeError('fetch failed');
+		},
+		hooks: {
+			beforeRetry: [() => new Response('nope', {status: 500})],
+			afterResponse: [({retryCount}) => {
+				afterResponseRetryCounts.push(retryCount);
+			}],
+			beforeError: [({error, retryCount}) => {
+				beforeErrorRetryCount = retryCount;
+				return error;
+			}],
+		},
+	}).text(), {instanceOf: HTTPError});
+
+	t.deepEqual(afterResponseRetryCounts, [1]);
+	t.is(beforeErrorRetryCount, 1);
+});
+
+test('HTTPError for a failing beforeRequest Response carries the parsed body as data', async t => {
+	const error = await t.throwsAsync<HTTPError>(ky('https://example.com', {
+		fetch: async () => new Response('fetched'),
+		hooks: {
+			beforeRequest: [() => Response.json({message: 'from cache'}, {status: 404})],
+		},
+	}).text(), {instanceOf: HTTPError});
+
+	t.is(error?.response.status, 404);
+	t.deepEqual(error?.data, {message: 'from cache'});
+});
+
+test('`parseJson` gets the replaced request for a `Response` from `beforeRequest`', async t => {
+	let parseJsonRequest: Request | undefined;
+	let hookRequest: Request | undefined;
+
+	const data = await ky('https://example.com', {
+		fetch: async () => new Response('{"fetched":true}'),
+		parseJson(text, {request}) {
+			parseJsonRequest = request;
+			return JSON.parse(text);
+		},
+		hooks: {
+			beforeRequest: [
+				({request}) => withHeader(request, 'x-hook', '1'),
+				({request}) => {
+					hookRequest = request;
+					return new Response('{"cached":true}');
+				},
+			],
+		},
+	}).json();
+
+	t.deepEqual(data, {cached: true});
+	t.is(parseJsonRequest?.headers.get('x-hook'), '1');
+	t.is(parseJsonRequest, hookRequest);
+});
+
 test('second afterResponse hook does not run when first throws, and no retry occurs', async t => {
 	let requestCount = 0;
 	let secondHookCalled = false;
@@ -5535,21 +5995,16 @@ test('init hook can modify retry', async t => {
 	t.is(fetchCount, 1);
 });
 
-test('init hook that throws propagates synchronously', t => {
-	t.throws(
-		() => {
-			void ky.get('https://example.com', {
-				hooks: {
-					init: [
-						() => {
-							throw new Error('init failed');
-						},
-					],
+test('init hook that throws rejects the returned promise', async t => {
+	await t.throwsAsync(ky.get('https://example.com', {
+		hooks: {
+			init: [
+				() => {
+					throw new Error('init failed');
 				},
-			});
+			],
 		},
-		{message: 'init failed'},
-	);
+	}), {message: 'init failed'});
 });
 
 test('init hook works with ky.create()', async t => {
@@ -5617,26 +6072,6 @@ test('multiple init hooks on the same call see each other\'s mutations', async t
 	});
 });
 
-test('init hook replacements stay normalized for later init hooks', async t => {
-	await ky.get('https://example.com', {
-		fetch: async () => new Response('ok'),
-		hooks: {
-			init: [
-				options => {
-					options.headers = new Headers({'X-Test': 'value'});
-					options.context = undefined;
-				},
-				options => {
-					t.deepEqual(options.headers, {'x-test': 'value'});
-					t.deepEqual(options.context, {});
-					options.headers['x-added'] = 'added';
-					options.context.added = true;
-				},
-			],
-		},
-	});
-});
-
 test('init hook sees per-request options merged with defaults', async t => {
 	t.plan(2);
 
@@ -5659,29 +6094,24 @@ test('init hook sees per-request options merged with defaults', async t => {
 	});
 });
 
-test('init hook error is not caught by beforeError hooks', t => {
+test('init hook error is not caught by beforeError hooks', async t => {
 	let beforeErrorCalled = false;
 
-	t.throws(
-		() => {
-			void ky.get('https://example.com', {
-				hooks: {
-					init: [
-						() => {
-							throw new Error('init boom');
-						},
-					],
-					beforeError: [
-						({error}) => {
-							beforeErrorCalled = true;
-							return error;
-						},
-					],
+	await t.throwsAsync(ky.get('https://example.com', {
+		hooks: {
+			init: [
+				() => {
+					throw new Error('init boom');
 				},
-			});
+			],
+			beforeError: [
+				({error}) => {
+					beforeErrorCalled = true;
+					return error;
+				},
+			],
 		},
-		{message: 'init boom'},
-	);
+	}), {message: 'init boom'});
 
 	t.false(beforeErrorCalled);
 });
@@ -5813,6 +6243,78 @@ test('init hook in-place retry mutations do not leak across requests', async t =
 	await t.throwsAsync(api.get('https://example.com', {fetch}));
 
 	t.deepEqual(seenLimits, [2, 2]);
+});
+
+test('init hook copy of retry keeps function values by reference', async t => {
+	let fetchCount = 0;
+	let shouldRetryCount = 0;
+	let delayCount = 0;
+	const seenFunctions: unknown[] = [];
+
+	const shouldRetry = () => {
+		shouldRetryCount++;
+		return true;
+	};
+
+	const retryDelay = () => {
+		delayCount++;
+		return 0;
+	};
+
+	const result = await ky('https://example.com', {
+		retry: {limit: 1, shouldRetry, delay: retryDelay},
+		async fetch() {
+			fetchCount++;
+			return fetchCount === 1 ? new Response('error', {status: 500}) : new Response('ok');
+		},
+		hooks: {
+			init: [options => {
+				const retry = options.retry as {shouldRetry: unknown; delay: unknown};
+				seenFunctions.push(retry.shouldRetry, retry.delay);
+			}],
+		},
+	}).text();
+
+	t.is(result, 'ok');
+	t.is(seenFunctions[0], shouldRetry);
+	t.is(seenFunctions[1], retryDelay);
+	t.is(shouldRetryCount, 1);
+	t.is(delayCount, 1);
+});
+
+test('init hook can change a frozen retry config without changing the source', async t => {
+	const retry = Object.freeze({
+		limit: 2,
+		methods: Object.freeze(['get'] as const),
+		delay: () => 0,
+	});
+	const seenRetries: Array<{limit: number; methods: string[]}> = [];
+	let fetchCount = 0;
+
+	const api = ky.extend({
+		retry,
+		async fetch() {
+			fetchCount++;
+			return new Response('error', {status: 500});
+		},
+		hooks: {
+			init: [options => {
+				const retryOptions = options.retry as {limit: number; methods: string[]};
+				seenRetries.push({limit: retryOptions.limit, methods: [...retryOptions.methods]});
+				retryOptions.limit = 0;
+				retryOptions.methods.push('post');
+			}],
+		},
+	});
+
+	await t.throwsAsync(api.get('https://example.com'), {instanceOf: HTTPError});
+	await t.throwsAsync(api.get('https://example.com'), {instanceOf: HTTPError});
+
+	t.is(fetchCount, 2);
+	t.deepEqual(seenRetries, [{limit: 2, methods: ['get']}, {limit: 2, methods: ['get']}]);
+	t.is(retry.limit, 2);
+	t.deepEqual(retry.methods, ['get']);
+	t.true(Object.isFrozen(retry.methods));
 });
 
 test('init hook nested retry mutations do not leak across requests', async t => {
@@ -6201,7 +6703,8 @@ test('init hook in-place context mutations do not leak across requests', async t
 	t.deepEqual(seenRequestIdentifiers, [1, 2]);
 });
 
-test('init hook nested context mutations do not leak across requests', async t => {
+// `init` hooks get a shallow `context` copy like every other hook, so a nested value such as a cache stays shared, and adding an `init` hook does not change that.
+test('init hook nested context values are shared across requests', async t => {
 	const seenCounts: number[] = [];
 
 	const api = ky.extend({
@@ -6221,10 +6724,10 @@ test('init hook nested context mutations do not leak across requests', async t =
 	await api.get('https://example.com');
 	await api.get('https://example.com');
 
-	t.deepEqual(seenCounts, [0, 0]);
+	t.deepEqual(seenCounts, [0, 1]);
 });
 
-test('init hook keeps a class-instance context value by reference across the deep clone', async t => {
+test('init hook keeps a class-instance context value by reference', async t => {
 	const store = new Map<string, number>();
 	let sawSameStore = false;
 
@@ -6897,13 +7400,11 @@ test('onUploadProgress works with a Request-like object returned from beforeRequ
 	}).text();
 
 	t.is(responseText, 'ok');
-	// Progress is best effort: the body is read by the runtime, not wrapped by Ky.
-	t.deepEqual(events, []);
+	// Progress is best effort: the body is read by the runtime, so it is not wrapped and no event is reported.
+	t.deepEqual(events, [], 'a Request-like result is sent as-is, so it reports no upload progress');
 });
 
-// `ky.stop` resolves the request with `undefined`, which is documented as incompatible with body method
-// shortcuts. The shortcut used to crash while masking the real reason with an internal TypeError that named
-// Ky's own internals instead of the returned symbol.
+// `ky.stop` resolves the request with `undefined`, which is documented as incompatible with body method shortcuts. The shortcut used to crash while masking the real reason with an internal TypeError that named Ky's own internals instead of the returned symbol.
 for (const type of ['json', 'text', 'arrayBuffer', 'blob', 'formData', 'bytes'] as const) {
 	test(`the \`${type}\` shortcut reports that \`ky.stop\` left no response`, async t => {
 		await t.throwsAsync(ky(requestFixtureUrl, {
@@ -6913,7 +7414,7 @@ for (const type of ['json', 'text', 'arrayBuffer', 'blob', 'formData', 'bytes'] 
 			},
 		})[type](), {
 			name: 'TypeError',
-			message: 'The request resolved without a response. Returning `ky.stop` from a `beforeRetry` hook is not compatible with body method shortcuts. Throw from the hook instead.',
+			message: noResponseMessage,
 		});
 	});
 }
@@ -6927,107 +7428,7 @@ test('`ky.stop` still resolves the plain request with `undefined`', async t => {
 	}), undefined);
 });
 
-// The defensive copy only ran on the values the options object started with. A hook that assigned one of its own
-// objects got that same object back for every later hook and every later request, so a mutation in a second hook
-// wrote straight through to the object the first hook owned.
-test('an `init` hook that assigns `json` hands later hooks a copy', async t => {
-	const bodies: string[] = [];
-	const ownBody = {list: [1, 2]};
-	const instance = ky.create({
-		method: 'POST',
-		json: {list: [1, 2]},
-		retry: 0,
-		hooks: {
-			init: [
-				options => {
-					options.json = ownBody;
-				},
-				options => {
-					(options.json as typeof ownBody).list.push(99);
-				},
-			],
-		},
-		async fetch(request) {
-			bodies.push(await request.clone().text());
-			return new Response('ok');
-		},
-	});
-
-	await instance('https://example.com').text();
-	await instance('https://example.com').text();
-
-	t.deepEqual(bodies, ['{"list":[1,2,99]}', '{"list":[1,2,99]}']);
-	t.deepEqual(ownBody, {list: [1, 2]});
-});
-
-test('an `init` hook that assigns `searchParams` or `context` hands later hooks a copy', async t => {
-	const urls: string[] = [];
-	const contexts: string[] = [];
-	const ownSearchParameters = {page: 1};
-	const ownContext = {token: 'first'};
-
-	const instance = ky.create({
-		retry: 0,
-		hooks: {
-			init: [
-				options => {
-					options.searchParams = ownSearchParameters;
-					options.context = ownContext;
-				},
-				options => {
-					(options.searchParams as typeof ownSearchParameters).page = 2;
-					(options.context as typeof ownContext).token = 'second';
-				},
-			],
-			beforeRequest: [({options}) => {
-				contexts.push(JSON.stringify(options.context));
-			}],
-		},
-		async fetch(request) {
-			urls.push(request.url);
-			return new Response('ok');
-		},
-	});
-
-	await instance('https://example.com').text();
-	await instance('https://example.com').text();
-
-	t.deepEqual(urls, ['https://example.com/?page=2', 'https://example.com/?page=2']);
-	t.deepEqual(contexts, ['{"token":"second"}', '{"token":"second"}']);
-	t.deepEqual(ownSearchParameters, {page: 1});
-	t.deepEqual(ownContext, {token: 'first'});
-});
-
-test('an `init` hook that assigns `retry` hands later hooks a copy', async t => {
-	const attemptCounts: number[] = [];
-	const ownRetry = {limit: 0, delay: () => 0};
-
-	const instance = ky.create({
-		hooks: {
-			init: [
-				options => {
-					options.retry = ownRetry;
-				},
-				options => {
-					(options.retry as typeof ownRetry).limit = 1;
-				},
-			],
-		},
-		async fetch() {
-			attemptCounts.push(1);
-			return new Response('server error', {status: 500});
-		},
-	});
-
-	await t.throwsAsync(instance('https://example.com').text());
-	await t.throwsAsync(instance('https://example.com').text());
-
-	t.deepEqual(attemptCounts, [1, 1, 1, 1]);
-	t.deepEqual(ownRetry, {limit: 0, delay: ownRetry.delay});
-});
-
-// `afterResponse` hooks deliberately receive the clone `#fetch()` prepared for a possible retry, whose body is
-// still unread, so a hook that forces a retry can copy an unconsumed request from it.
+// `afterResponse` hooks deliberately receive the clone `#fetch()` prepared for a possible retry, whose body is still unread, so a hook that forces a retry can copy an unconsumed request from it.
 test('an `afterResponse` hook can copy the unconsumed request it is given', async t => {
 	const bodies: string[] = [];
 	let attempts = 0;
@@ -7085,7 +7486,7 @@ test('a `beforeError` hook receives the request that failed', async t => {
 
 		// eslint-disable-next-line no-await-in-loop
 		const error = await t.throwsAsync(ky('https://example.com', {
-			retry,
+			retry: {limit: retry, delay: () => 0},
 			async fetch(request) {
 				sent = request;
 				return new Response('server error', {status: 500});
@@ -7102,6 +7503,63 @@ test('a `beforeError` hook receives the request that failed', async t => {
 		t.is(errorRequest, sent, `retry: ${retry}`);
 		t.is((error as {request?: unknown}).request, sent, `retry: ${retry}`);
 	}
+});
+
+test('error.request for a beforeRequest Response is the request after hook replacement', async t => {
+	let hookRequest: Request | undefined;
+	let beforeErrorRequest: Request | undefined;
+	let fetchCount = 0;
+
+	const error = await t.throwsAsync<HTTPError>(ky('https://example.com', {
+		retry: 0,
+		async fetch() {
+			fetchCount++;
+			return new Response('fetched');
+		},
+		hooks: {
+			beforeRequest: [
+				({request}) => new Request(request, {headers: {'x-hook': '1'}}),
+				({request}) => {
+					hookRequest = request;
+					return new Response('nope', {status: 500});
+				},
+			],
+			beforeError: [({request, error}) => {
+				beforeErrorRequest = request;
+				return error;
+			}],
+		},
+	}).text(), {instanceOf: HTTPError});
+
+	t.is(fetchCount, 0);
+	t.is(error?.request.headers.get('x-hook'), '1');
+	t.is(error?.request, hookRequest);
+	t.is(beforeErrorRequest, hookRequest);
+});
+
+test('error.request for a failing response from afterResponse is the request that was sent', async t => {
+	const sent: Request[] = [];
+	let beforeErrorRequest: Request | undefined;
+
+	const error = await t.throwsAsync<HTTPError>(ky('https://example.com', {
+		// A retry limit makes Ky prepare a clone of the request before sending, which must not be reported.
+		retry: {limit: 1, statusCodes: [503], delay: () => 0},
+		async fetch(input) {
+			sent.push(input as Request);
+			return new Response('ok');
+		},
+		hooks: {
+			afterResponse: [() => new Response('bad', {status: 500})],
+			beforeError: [({request, error}) => {
+				beforeErrorRequest = request;
+				return error;
+			}],
+		},
+	}).text(), {instanceOf: HTTPError});
+
+	t.is(sent.length, 1);
+	t.is(error?.request, sent[0]);
+	t.is(beforeErrorRequest, sent[0]);
 });
 
 test('a `beforeError` hook receives the request that failed during a body read', async t => {
@@ -7129,8 +7587,56 @@ test('a `beforeError` hook receives the request that failed during a body read',
 	t.is(hookRequests[0], sent);
 });
 
-// The cleanup in the request pipeline cancelled the current request body even when fetch was never called, so a
-// caller-owned upload stream was destroyed by a configuration error or a hook that threw before the request started.
+// The `totalTimeout` path releases the value a hook eventually returns once the timer wins, but the abort path did not, so a hook that lost the race leaked the body of the Response or Request it was about to return.
+for (const [label, makeHookResult] of [
+	['Response', (stream: ReadableStream<Uint8Array>) => new Response(stream)],
+	['Request', (stream: ReadableStream<Uint8Array>) => new Request('https://example.com', {
+		method: 'POST',
+		body: stream,
+		// @ts-expect-error - Types are outdated.
+		duplex: 'half',
+	})],
+] as Array<[string, (stream: ReadableStream<Uint8Array>) => unknown]>) {
+	test(`an abort that beats a hook releases the ${label} it was about to return`, async t => {
+		const controller = new AbortController();
+		let cancelled = false;
+		let releaseHook: () => void;
+		const gate = new Promise<void>(resolve => {
+			releaseHook = resolve;
+		});
+
+		const promise = ky('https://example.com', {
+			signal: controller.signal,
+			retry: 0,
+			fetch: async () => new Response('ok'),
+			hooks: {
+				// The hook only returns its value once the request has already been rejected, so the race is decided by the abort rather than by how two timers happen to interleave.
+				beforeRequest: [async () => {
+					await gate;
+
+					// Nothing has read this body, so only a cancel releases it.
+					return makeHookResult(new ReadableStream<Uint8Array>({
+						cancel() {
+							cancelled = true;
+						},
+					}));
+				}],
+			},
+		});
+
+		const settled = promise.catch(() => 'rejected' as const);
+		setTimeout(() => {
+			controller.abort();
+		}, 0);
+
+		t.is(await settled, 'rejected');
+		releaseHook!();
+		await delay(50);
+		t.true(cancelled, `the ${label} body must be released`);
+	});
+}
+
+// The cleanup in the request pipeline cancelled the current request body even when fetch was never called, so a caller-owned upload stream was destroyed by a configuration error or a hook that threw before the request started.
 test('a request that never started leaves the caller-owned body alone', async t => {
 	const failedFetches: boolean[] = [];
 	const cancelledBodies: boolean[] = [];
@@ -7152,6 +7658,21 @@ test('a request that never started leaves the caller-owned body alone', async t 
 				}],
 			},
 		},
+		// A hook that answers the request itself never reaches fetch either.
+		{
+			hooks: {
+				beforeRequest: [() => new Response('from the hook')],
+			},
+		},
+		// Neither does a `totalTimeout` that runs out inside a hook.
+		{
+			totalTimeout: 20,
+			hooks: {
+				beforeRequest: [async () => {
+					await delay(200);
+				}],
+			},
+		},
 	]) {
 		let cancelled = false;
 		let fetchCalled = false;
@@ -7164,34 +7685,41 @@ test('a request that never started leaves the caller-owned body alone', async t 
 			},
 		});
 
-		// eslint-disable-next-line no-await-in-loop
-		await t.throwsAsync(ky('https://example.com', {
-			method: 'POST',
-			body,
-			retry: 0,
-			...options,
-			async fetch() {
-				fetchCalled = true;
-				return new Response('ok');
-			},
-		}).text());
+		// Some of these throw and some resolve, for example a hook that answers the request itself, so the outcome is not asserted here. What matters is that fetch never ran and the caller's body survived.
+		try {
+			// eslint-disable-next-line no-await-in-loop
+			await ky('https://example.com', {
+				method: 'POST',
+				body,
+				retry: 0,
+				...options,
+				async fetch() {
+					fetchCalled = true;
+					return new Response('ok');
+				},
+			}).text();
+		} catch {}
 
 		failedFetches.push(fetchCalled);
 		cancelledBodies.push(cancelled);
 	}
 
-	t.deepEqual(failedFetches, [false, false, false]);
-	t.deepEqual(cancelledBodies, [false, false, false]);
+	t.deepEqual(failedFetches, [false, false, false, false, false]);
+	t.deepEqual(cancelledBodies, [false, false, false, false, false]);
 });
 
 test('a request that did start still releases its upload body', async t => {
-	let cancelled = false;
+	let release: () => void;
+	// Awaiting the cancel itself, rather than a sleep, keeps this reliable on a loaded machine.
+	const cancelled = new Promise<void>(resolve => {
+		release = resolve;
+	});
 	const body = new ReadableStream<Uint8Array>({
 		start(controller) {
 			controller.enqueue(new TextEncoder().encode('hi'));
 		},
 		cancel() {
-			cancelled = true;
+			release!();
 		},
 	});
 
@@ -7202,46 +7730,44 @@ test('a request that did start still releases its upload body', async t => {
 		fetch: async () => new Response('ok'),
 	}).text();
 
-	await new Promise(resolve => {
-		setTimeout(resolve, 10);
-	});
-
-	t.true(cancelled);
+	await cancelled;
+	t.pass();
 });
 
-// `newHookValue` merged with `deepMerge`, which ignores sources that are neither arrays nor objects, so a single
-// function, a string or `null` was dropped without a word and the hook simply never ran.
-test('rejects a hook list that is not an array', t => {
+// `newHookValue` merged with `deepMerge`, which ignores sources that are neither arrays nor objects, so a single function, a string or a `null` was dropped without a word and the hook simply never ran. `null` is reported like any other bad shape, since `undefined` is how a hook list is cleared.
+test('rejects a hook list that is not an array', async t => {
 	for (const [key, value] of [
 		['init', () => undefined],
 		['beforeRequest', 'not a function'],
-		['afterResponse', null],
 		['beforeRetry', {}],
 		['beforeError', 0],
+		['afterResponse', true],
+		['beforeRequest', null],
+		// An entry that is not a function only failed once the hook ran, with an error that did not name the option.
+		['beforeRequest', [null]],
+		['afterResponse', [() => undefined, 'not a function']],
 	] as Array<[string, unknown]>) {
 		const hooks: Record<string, unknown> = {[key]: value};
 
-		t.throws(() => {
-			void ky('https://example.com', {hooks: hooks as never});
-		}, {
+		// eslint-disable-next-line no-await-in-loop
+		await t.throwsAsync(ky('https://example.com', {hooks: hooks as never}), {
 			instanceOf: TypeError,
-			message: `\`hooks.${key}\` must be an array`,
+			message: `\`hooks.${key}\` must be an array of functions`,
 		}, `${key}: ${JSON.stringify(value)}`);
 	}
 });
 
-test('rejects `replaceOption()` around a non-array hook list', t => {
+test('rejects `replaceOption()` around a non-array hook list', async t => {
 	for (const value of [() => undefined, 42, {}] as unknown[]) {
-		t.throws(() => {
-			void ky('https://example.com', {hooks: {beforeRetry: replaceOption(value as never)}});
-		}, {
+		// eslint-disable-next-line no-await-in-loop
+		await t.throwsAsync(ky('https://example.com', {hooks: {beforeRetry: replaceOption(value as never)}}), {
 			instanceOf: TypeError,
-			message: '`hooks.beforeRetry` must be an array',
+			message: '`hooks.beforeRetry` must be an array of functions',
 		});
 	}
 });
 
-test('a single-function hook is reported instead of silently dropped', t => {
+test('a single-function hook is reported instead of silently dropped', async t => {
 	let ran = 0;
 	const hooks = {
 		beforeRequest: (() => {
@@ -7249,36 +7775,58 @@ test('a single-function hook is reported instead of silently dropped', t => {
 		}) as never,
 	};
 
-	const error = t.throws(() => {
-		void ky('https://example.com', {
-			retry: 0,
-			hooks,
-			fetch: async () => new Response('ok'),
-		});
-	});
+	const error = await t.throwsAsync(ky('https://example.com', {
+		retry: 0,
+		hooks,
+		fetch: async () => new Response('ok'),
+	}));
 
-	t.is(error?.message, '`hooks.beforeRequest` must be an array');
+	t.is(error?.message, '`hooks.beforeRequest` must be an array of functions');
 	t.is(ran, 0);
 });
 
-test('`hooks` that is not an object reports a clear error', t => {
+test('`hooks` that is not an object reports a clear error', async t => {
 	for (const hooks of ['none', 42, true, []] as unknown[]) {
-		t.throws(() => {
-			void ky('https://example.com', {hooks: hooks as never});
-		}, {
+		// eslint-disable-next-line no-await-in-loop
+		await t.throwsAsync(ky('https://example.com', {hooks: hooks as never}), {
 			instanceOf: TypeError,
 			message: 'The `hooks` option must be an object',
 		}, `hooks: ${JSON.stringify(hooks)}`);
 	}
 });
 
-test('`hooks: null` selects the default', async t => {
-	t.is(await ky('https://example.com', {hooks: null as never, fetch: async () => new Response('ok')}).text(), 'ok');
+// `hooks: null` used to reach `Object.hasOwn(null, ...)` and report an internal error. It is reported like any other bad shape instead, since `undefined` is how the option is omitted.
+test('`hooks: null` reports a clear error', async t => {
+	for (const hooks of [null, 'none', 42, true, []] as unknown[]) {
+		// eslint-disable-next-line no-await-in-loop
+		await t.throwsAsync(ky('https://example.com', {hooks: hooks as never}), {
+			instanceOf: TypeError,
+			message: 'The `hooks` option must be an object',
+		}, `hooks: ${JSON.stringify(hooks)}`);
+	}
 });
 
-// `instanceof Error` fails for an error from another realm, so a cross-realm failure skipped the hooks entirely and
-// a cross-realm replacement from a hook was dropped. The Ky type guards already accept branded errors from another
-// copy of Ky, so the error checks here read the internal brand too.
+test('an explicit `undefined` hook list clears the parent hooks', async t => {
+	const cleared: string[] = [];
+	const undefinedHookList: Options = {hooks: {beforeRequest: undefined}};
+	const instance = ky.create({
+		hooks: {
+			beforeRequest: [() => {
+				cleared.push('parent');
+			}],
+		},
+		fetch: async () => new Response('ok'),
+	});
+
+	await instance('https://example.com', undefinedHookList).text();
+	t.deepEqual(cleared, []);
+
+	await instance('https://example.com').text();
+	t.deepEqual(cleared, ['parent']);
+	t.is(await instance('https://example.com', undefinedHookList).text(), 'ok');
+});
+
+// `instanceof Error` fails for an error from another realm, so a cross-realm failure skipped the hooks entirely and a cross-realm replacement from a hook was dropped. The Ky type guards already accept branded errors from another copy of Ky, so the error checks here read the internal brand too.
 test('a cross-realm error thrown by fetch still runs `beforeError` hooks', async t => {
 	const foreignError = runInNewContext('new Error("foreign fetch failure")') as Error;
 	const seen: string[] = [];
@@ -7388,4 +7936,128 @@ test('a `ky.retry()` marker is recognised across Ky copies', async t => {
 	t.is(text, 'ok');
 	t.is(attempts, 3);
 	t.deepEqual(seenCodes, ['FOREIGN_COPY', 'FOREIGN_COPY']);
+});
+
+// `#beforeRetryHookErrors` decided with `instanceof Error` while `#throwProcessedError` decided with the realm-safe `isError`, so a cross-realm error thrown by a `beforeRetry` hook reached the `beforeError` hooks while an identical same-realm error did not, contradicting "Ky will not handle it in any way".
+test('a cross-realm error from a `beforeRetry` hook skips the `beforeError` hooks', async t => {
+	const foreignError = runInNewContext('new Error("from a beforeRetry hook")') as Error;
+
+	for (const [label, thrown] of [
+		['same realm', new Error('from a beforeRetry hook')],
+		['another realm', foreignError],
+	] as Array<[string, Error]>) {
+		const seen: string[] = [];
+
+		// eslint-disable-next-line no-await-in-loop
+		const error = await t.throwsAsync(ky('https://example.com', {
+			retry: {limit: 1, delay: () => 0},
+			fetch: async () => new Response('server error', {status: 500}),
+			hooks: {
+				beforeRetry: [() => {
+					throw thrown;
+				}],
+				beforeError: [({error: hookError}) => {
+					seen.push(hookError.message);
+				}],
+			},
+		}).text());
+
+		t.is(error, thrown, label);
+		t.deepEqual(seen, [], `${label}: the hook error must propagate unchanged`);
+	}
+});
+
+// `shouldRetry` and `beforeRetry` used `instanceof Error`, so a cross-realm error reached them as a `NonError`, while `beforeError` got the error itself.
+test('a cross-realm error reaches `shouldRetry` and `beforeRetry` as itself', async t => {
+	const foreignError = runInNewContext('new Error("foreign fetch failure")') as Error;
+	const seen: unknown[] = [];
+
+	await t.throwsAsync(ky('https://example.com', {
+		retry: {
+			limit: 1,
+			delay: () => 0,
+			shouldRetry({error}) {
+				seen.push(error);
+				return true;
+			},
+		},
+		async fetch() {
+			throw foreignError;
+		},
+		hooks: {
+			beforeRetry: [({error}) => {
+				seen.push(error);
+			}],
+		},
+	}).text(), {message: 'foreign fetch failure'});
+
+	t.is(seen.length, 2);
+	t.true(seen.every(error => error === foreignError));
+});
+
+test('a cross-realm `ky.retry({cause})` is kept as the cause', async t => {
+	const foreignError = runInNewContext('new Error("foreign cause")') as Error;
+	let cause: unknown;
+
+	await ky('https://example.com', {
+		retry: {limit: 1, delay: () => 0},
+		fetch: async () => new Response('ok'),
+		hooks: {
+			afterResponse: [({retryCount}) => retryCount === 0 ? ky.retry({cause: foreignError}) : undefined],
+			beforeRetry: [({error}) => {
+				cause = error.cause;
+			}],
+		},
+	}).text();
+
+	t.is(cause, foreignError);
+});
+
+// A `Response` from a `beforeRetry` hook was not fetched by Ky, so it was reported with the retry clone that was never sent, while `beforeError` got the request that was sent.
+test('a `Response` from `beforeRetry` is reported with the request that was sent', async t => {
+	const sent: Request[] = [];
+	let beforeErrorRequest: Request | undefined;
+
+	const error = await t.throwsAsync<HTTPError>(ky('https://example.com', {
+		retry: {limit: 1, delay: () => 0},
+		async fetch(input) {
+			sent.push(input as Request);
+			return new Response('first', {status: 500});
+		},
+		hooks: {
+			beforeRetry: [() => new Response('from hook', {status: 503})],
+			beforeError: [({request, error}) => {
+				beforeErrorRequest = request;
+				return error;
+			}],
+		},
+	}).text());
+
+	t.is(sent.length, 1);
+	t.is(error?.request, sent[0]);
+	t.is(beforeErrorRequest, sent[0]);
+});
+
+test('`parseJson` gets the request that was sent for a `Response` from `beforeRetry`', async t => {
+	const sent: Request[] = [];
+	let parseJsonRequest: Request | undefined;
+
+	const data = await ky('https://example.com', {
+		retry: {limit: 1, delay: () => 0},
+		async fetch(input) {
+			sent.push(input as Request);
+			return new Response('', {status: 500});
+		},
+		parseJson(text, {request}) {
+			parseJsonRequest = request;
+			return JSON.parse(text);
+		},
+		hooks: {
+			beforeRetry: [() => new Response('{"a":1}')],
+		},
+	}).json();
+
+	t.deepEqual(data, {a: 1});
+	t.is(sent.length, 1);
+	t.is(parseJsonRequest, sent[0]);
 });

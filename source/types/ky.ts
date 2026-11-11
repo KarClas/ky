@@ -6,6 +6,8 @@ export type KyInstance = {
 	/**
 	Fetch the given `url`.
 
+	Invalid options, an invalid `input`, and an error thrown by an `init` hook reject the returned promise instead of throwing, the same way `fetch()` reports them. They are not passed to `beforeError` hooks, because no request was made.
+
 	@param url - `Request` object, `URL` object, or URL string.
 	@returns A promise with `Body` method added.
 
@@ -89,7 +91,7 @@ export type KyInstance = {
 
 	In contrast to `ky.create()`, `ky.extend()` inherits defaults from its parent.
 
-	You can pass headers as a `Headers` instance or a plain object. Headers are normalized to a plain object with lowercase names when options are merged, so `init` hooks always see a plain object with lowercase keys. A header removed with `undefined` stays in that object with an `undefined` value.
+	You can pass headers as a `Headers` instance or a plain object. Headers are normalized to a plain object with lowercase names when options are merged, so `init` hooks start with a plain object with lowercase keys. A header removed with `undefined` stays in that object with an `undefined` value.
 
 	You can remove a header with `.extend()` by passing the header with an `undefined` value. Passing `undefined` as a string removes the header only if it comes from a `Headers` instance.
 
@@ -123,7 +125,7 @@ export type KyInstance = {
 	/**
 	A `Symbol` that can be returned by a `beforeRetry` hook to stop the retry. This will also short circuit the remaining `beforeRetry` hooks.
 
-	Note: Returning this symbol makes Ky abort and return with an `undefined` response. Be sure to check for a response before accessing any properties on it or use [optional chaining](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/Optional_chaining). It is also incompatible with body methods, such as `.json()` or `.text()`, because there is no response to parse. In general, we recommend throwing an error instead of returning this symbol, as that will cause Ky to abort and then throw, which avoids these limitations.
+	Note: Returning this symbol makes Ky abort and return with an `undefined` response. Be sure to check for a response before accessing any properties on it or use [optional chaining](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/Optional_chaining). It is also incompatible with body methods, such as `.json()` or `.text()`, because there is no response to parse. Calling one throws a `TypeError` explaining this. In general, we recommend throwing an error instead of returning this symbol, as that will cause Ky to abort and then throw, which avoids these limitations.
 
 	A valid use-case for `ky.stop` is to prevent retries when making requests for side effects, where the returned data is not important. For example, logging client activity to the server.
 
@@ -131,11 +133,11 @@ export type KyInstance = {
 	```
 	import ky from 'ky';
 
-	// Note that response will be `undefined` in case `ky.stop` is returned.
+	// Note that `response` will be `undefined` in case `ky.stop` is returned.
 	const response = await ky.post('https://example.com', {
 		hooks: {
 			beforeRetry: [
-				async ({error}) => {
+				async ({request, options, error, retryCount}) => {
 					const shouldStopRetry = await ky('https://example.com/api');
 					if (shouldStopRetry) {
 						return ky.stop;
@@ -145,8 +147,7 @@ export type KyInstance = {
 		}
 	});
 
-	// Using `.text()` or other body methods is not supported.
-	// const text = await ky('https://example.com', options).text();
+	// Using `.text()` or other body methods is not supported, because there is no response to parse.
 	```
 	*/
 	readonly stop: typeof stop;
@@ -155,6 +156,8 @@ export type KyInstance = {
 	Force a retry from an `afterResponse` hook.
 
 	This allows you to retry a request based on the response content, even if the response has a successful status code. The retry will respect the `retry.limit` option and skip the `shouldRetry` check. The forced retry is observable in `beforeRetry` hooks, where the error will be a `ForceRetryError`.
+
+	A marker returned by a second copy of Ky, which happens with a duplicated dependency, is still recognised, the same way the Ky error guards accept branded errors.
 
 	@example
 	```

@@ -185,6 +185,8 @@ export type KyOptions = {
 
 	Network errors (e.g., DNS failures, connection refused, offline) are automatically retried for retriable methods. Only errors recognized as network errors are retried; other errors (e.g., programming bugs) are thrown immediately. Use `shouldRetry` to customize this behavior.
 
+	A hook can change `retry.limit` through `options`. Ky reads the limit again when each attempt starts. A `beforeRequest` or `beforeRetry` hook runs before the attempt starts, so it can lower or raise the limit. An `afterResponse` hook runs after the attempt started, so it can lower the limit, for example to stop retrying once a response says so. A higher limit set there only applies from the next attempt.
+
 	`413 Payload Too Large` is only retried when the response includes a retry timing header, unless `shouldRetry` returns `true`.
 
 	When the response status is contained in `afterStatusCodes` and the retry is allowed by `statusCodes` or `shouldRetry`, Ky uses retry timing headers to choose the retry delay. [`Retry-After`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After) may provide a delay in seconds or an HTTP-date. If `Retry-After` is missing, Ky falls back to rate-limit timing headers (`RateLimit-Reset`, `X-RateLimit-Retry-After`, `X-RateLimit-Reset`, and `X-Rate-Limit-Reset`). Numeric `Retry-After` and `X-RateLimit-Retry-After` values are interpreted as delay seconds. Numeric `RateLimit-Reset`, `X-RateLimit-Reset`, and `X-Rate-Limit-Reset` values may also be interpreted as Unix timestamps, from 2001-09-09 onwards. A value below that is read as delay seconds, and a timestamp already in the past means the retry happens immediately. If the status code is not in `afterStatusCodes`, retry timing headers will be ignored.
@@ -207,16 +209,18 @@ export type KyOptions = {
 	retry?: RetryOptions | number | undefined;
 
 	/**
-	Per-attempt timeout in milliseconds for getting a response, applied independently to each retry. Ky shortcut methods also use this value as a separate timeout for reading the response body. Cannot be greater than 2147483647. See also `totalTimeout`.
+	Per-attempt timeout in milliseconds for getting a response, applied independently to each retry. Ky shortcut methods also use this value as a separate timeout for reading the response body. Must be a non-negative number or `false`, or a `TypeError` is thrown. A value greater than 2147483647, `Infinity` included, throws a `RangeError`. See also `totalTimeout`.
 
 	If set to `false`, there will be no per-attempt timeout.
+
+	If the signal you passed in is aborted while a body method is reading, or just after the read finished, the body method rejects with the abort reason rather than resolving with the bytes that already arrived.
 
 	@default 10000
 	*/
 	timeout?: number | false | undefined;
 
 	/**
-	Overall timeout in milliseconds for the entire operation, including retries and delays. Throws a `TimeoutError` if exceeded. Cannot be greater than 2147483647.
+	Overall timeout in milliseconds for the entire operation, including retries and delays. Throws a `TimeoutError` if exceeded. Must be a non-negative number or `false`, or a `TypeError` is thrown. A value greater than 2147483647, `Infinity` included, throws a `RangeError`.
 
 	`beforeError` hooks run after an error is produced and are not bounded by `totalTimeout`.
 
@@ -265,6 +269,8 @@ export type KyOptions = {
 
 	/**
 	Hooks allow modifications during the request lifecycle. Hook functions may be async and are run serially, unless otherwise noted.
+
+	Each hook must be an array of functions. A single function, a string, or any other value, `null` included, throws a `TypeError` rather than being silently dropped. `undefined` means absent, so it clears the hooks it would have replaced.
 	*/
 	hooks?: Hooks | undefined;
 
@@ -289,11 +295,11 @@ export type KyOptions = {
 	@param progress - Object containing download progress information.
 	@param chunk - Data that was received. When an empty response body stream completes, the callback receives an empty chunk.
 
-	`content-length` is only used as the total for a response that is not content-coded, since it counts encoded bytes while the progress stream counts the bytes after decompression. A compressed response therefore reports `totalBytes: 0` until it completes, which means the percentage cannot be calculated while downloading.
+	`content-length` is only used as the total for a response that is not content-coded, since it counts encoded bytes while the progress stream counts the bytes after decompression. A compressed response therefore reports `totalBytes: 0` until it completes, which means the percentage cannot be calculated while downloading. For a cross-origin response in a browser, `content-encoding` is only visible when the server lists it in `Access-Control-Expose-Headers`. Otherwise Ky cannot tell that the response is compressed, so it uses `content-length` and the percentage stays close to 100% for most of the download.
 
-	Responses with no body at all are not streamed, so no progress events are emitted for them. That covers a [null body status](https://fetch.spec.whatwg.org/#null-body-status) such as `204`, and a `HEAD` request, which has no body even on an ordinary status. A response whose body an `afterResponse` hook already read, or locked with a reader, is passed through unchanged, so it reports no progress either.
+	Responses with no body at all are not streamed, so no progress events are emitted for them. That covers a [null body status](https://fetch.spec.whatwg.org/#null-body-status) such as `204`, and a `HEAD` response in runtimes that give it no body, such as browsers, Node.js and Deno. Bun gives a `HEAD` response an empty body, so it reports one final event with `transferredBytes: 0`. A response whose body an `afterResponse` hook already read, or locked with a reader, is passed through unchanged, so it reports no progress either.
 
-	When the callback throws, the error is reported by Ky's body method shortcuts. A response read directly with `response.text()` or `response.json()` may instead report the runtime's own stream error, such as Chromium's generic `TypeError`.
+	Do not throw from the callback. A throw fails the response stream, which the runtime reports in its own way: Node.js rejects the body read with your error, while Chromium reports a network failure, so Ky's body methods throw a `NetworkError` there. Pass a `signal` from an `AbortController` to cancel instead.
 
 	@example
 	```
@@ -313,12 +319,14 @@ export type KyOptions = {
 	/**
 	Upload progress event handler.
 
-	Note: Requires [request stream support](https://caniuse.com/wf-fetch-request-streams) and, in Chromium-based browsers, an HTTP/2 or HTTP/3 connection (streaming uploads over HTTP/1.1 fail with a network error, even over plain HTTP). This handler is silently ignored in unsupported environments and for requests with `keepalive: true` or `mode: 'no-cors'`, since they cannot use streaming request bodies.
+	Note: Requires [request stream support](https://caniuse.com/wf-fetch-request-streams) and, in Chromium-based browsers, an HTTP/2 or HTTP/3 connection (streaming uploads over HTTP/1.1 fail with a network error, even over plain HTTP). This handler is silently ignored in unsupported environments and for requests with `keepalive: true` or `mode: 'no-cors'`, since they cannot use streaming request bodies. If an upload fails over HTTP/1.1 in Chromium, you can retry it without upload progress by returning `{options: {onUploadProgress: undefined}}` from a [`beforeRetry`](#hooksbeforeretry) hook.
 
 	@param progress - Object containing upload progress information.
 	@param chunk - Data that was sent. When an empty request body stream completes, the callback receives an empty chunk.
 
-	A `ReadableStream` body cannot be measured, so `totalBytes` falls back to a `content-length` header you set. Browsers do not allow that header on a request, so there the total stays `0`.
+	A `ReadableStream` body cannot be measured, so `totalBytes` falls back to a `content-length` header you set. Browsers do not allow that header on a request, so there the total stays `0`. When a hook replaces the request, `totalBytes` is still estimated from the `body` option until the final event, which reports the real total.
+
+	Do not throw from the callback. A throw fails the upload stream, which the runtime reports as a network failure, so Ky throws a `NetworkError` (in Node.js, with your error in its `cause` chain) and retries it like any other network error, running the callback again. Pass a `signal` from an `AbortController` to cancel instead.
 
 	@example
 	```
@@ -338,7 +346,7 @@ export type KyOptions = {
 
 	/**
 	User-defined `fetch` function.
-	Has to be fully compatible with the [Fetch API](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API) standard.
+	Has to be fully compatible with the [Fetch API](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API) standard. It must resolve with a `Response`, or a `TypeError` is thrown.
 
 	Use-cases:
 	1. Use the `fetch` wrapper function provided by some frameworks that use server-side rendering (SSR).
@@ -377,8 +385,6 @@ export type KyOptions = {
 	- Pass serverless environment bindings (e.g., Cloudflare Workers)
 
 	**Note:** Context is shallow merged. Top-level properties are merged, but nested objects are replaced. Only enumerable properties are copied.
-
-	**Note:** Each request gets its own deep copy of the context, so a hook that mutates a nested plain object or array cannot write back to the instance defaults or to the object you passed in. Non-plain values such as class instances are shared by reference. A hook that caches data in the context, for example with `options.context.token ??= await getToken()`, therefore recomputes it once per request rather than once per instance.
 
 	@example
 	```
@@ -449,24 +455,6 @@ export interface Options extends KyOptions, RequestOptions { // eslint-disable-l
 	/**
 	HTTP method used to make the request.
 
-	Ky forwards every option it does not recognize straight to `fetch()`, so fetch-only extensions are supported even
-	when the ambient `RequestInit` type does not declare them. The two documented below are declared here for that
-	reason; any other extension is accepted at runtime and needs a type assertion.
-	*/
-
-	/**
-	An undici `Agent` or `Dispatcher`, forwarded to `fetch()` as-is.
-	*/
-	dispatcher?: unknown;
-
-	/**
-	A framework-specific fetch extension, such as Next.js's `next`, forwarded to `fetch()` as-is.
-	*/
-	next?: unknown;
-
-	/**
-	HTTP method used to make the request.
-
 	Internally, the standard methods (`GET`, `POST`, `PUT`, `PATCH`, `HEAD`, `DELETE`, and `QUERY`) are uppercased in order to avoid server errors due to case sensitivity.
 	*/
 	method?: LiteralUnion<HttpMethod, string> | undefined;
@@ -474,7 +462,7 @@ export interface Options extends KyOptions, RequestOptions { // eslint-disable-l
 	/**
 	HTTP headers used to make the request.
 
-	You can pass a `Headers` instance or a plain object. Headers are normalized to a plain object with lowercase names when options are merged, so `init` hooks always see a plain object with lowercase keys. A header removed with `undefined` stays in that object with an `undefined` value.
+	You can pass a `Headers` instance or a plain object. Headers are normalized to a plain object with lowercase names when options are merged, so `init` hooks start with a plain object with lowercase keys. A header removed with `undefined` stays in that object with an `undefined` value.
 
 	You can remove a header with `.extend()` by passing the header with an `undefined` value. Passing `undefined` as a string removes the header only if it comes from a `Headers` instance.
 
@@ -494,16 +482,21 @@ export interface Options extends KyOptions, RequestOptions { // eslint-disable-l
 	const extended = original.extend({
 		headers: {
 			rainbow: undefined
+		},
+		hooks: {
+			beforeRequest: [
+				({request}) => {
+					console.log(request.headers.has('rainbow'));
+					//=> false
+
+					console.log(request.headers.has('unicorn'));
+					//=> true
+				}
+			]
 		}
 	});
 
-	const response = await extended(url);
-
-	console.log(response.headers.has('rainbow'));
-	//=> false
-
-	console.log(response.headers.has('unicorn'));
-	//=> true
+	await extended(url);
 	```
 	*/
 	headers?: KyHeadersInit | undefined;
@@ -519,11 +512,7 @@ export interface Options extends KyOptions, RequestOptions { // eslint-disable-l
 	signal?: AbortSignal | null | undefined;
 }
 
-export type InitOptions = Omit<Options, 'retry' | 'hooks' | 'headers' | 'context'> & {
-	get headers(): Record<string, string | undefined>;
-	set headers(value: KyHeadersInit | undefined);
-	get context(): Record<string, unknown>;
-	set context(value: Record<string, unknown> | undefined);
+export type InitOptions = Omit<Options, 'retry' | 'hooks'> & {
 	retry?: MutableRetryOptions | number | undefined;
 	hooks?: {[Key in keyof Hooks]?: NormalizedHooks[Key] | undefined} | undefined;
 };

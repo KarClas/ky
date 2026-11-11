@@ -1,27 +1,28 @@
 import {kyOptionKeys, requestOptionsRegistry} from '../core/constants.js';
 import type {SearchParamsOption} from '../types/options.js';
-import {deletedParametersSymbol} from './merge.js';
+import {deletedParametersSymbol, type MarkedSearchParameters} from './merge.js';
 
 export const findUnknownOptions = (
 	options: Record<string, unknown>,
 ): Record<string, unknown> => {
 	const unknownOptions: Record<string, unknown> = {};
 
-	for (const key in options) {
-		// Skip inherited properties
-		if (!Object.hasOwn(options, key)) {
-			continue;
-		}
-
+	// `Object.keys()` skips inherited properties.
+	for (const key of Object.keys(options)) {
 		// Forward every non-standard, non-Ky option to fetch().
 		// We intentionally do not check whether the key also exists on `Request`, because some runtimes
 		// patch `Request.prototype` with fetch-only extensions. For example, Next.js adds `next`, and the
 		// old `key in request` heuristic dropped it unless Ky kept a special-case allowlist.
 		// Passing all non-standard keys makes that allowlist unnecessary and preserves future fetch extensions too.
-		// The registries are plain objects, so `Object.hasOwn()` is required: `in` would also match
-		// `Object.prototype` members such as `constructor` and `toString`, silently dropping those options.
+		// The registries are plain objects, so `Object.hasOwn()` is required: `in` would also match `Object.prototype` members such as `constructor` and `toString`, silently dropping those options.
 		if (!Object.hasOwn(requestOptionsRegistry, key) && !Object.hasOwn(kyOptionKeys, key)) {
-			unknownOptions[key] = options[key];
+			// Defined instead of assigned, so a `__proto__` key becomes an own property of the init object rather than replacing its prototype, which would both drop the option and give `fetch()` an object that inherits from caller data.
+			Object.defineProperty(unknownOptions, key, {
+				value: options[key],
+				writable: true,
+				enumerable: true,
+				configurable: true,
+			});
 		}
 	}
 
@@ -33,7 +34,7 @@ export const hasSearchParameters = (search: SearchParamsOption): boolean => {
 		return false;
 	}
 
-	// Option merging turns `null` into an absent value, but an `init` hook assigns straight onto the options object. `null` is not accepted, so report it instead of treating it as absent.
+	// Option merging already rejects `null`, but an `init` hook assigns straight onto the options object.
 	if (search === null) {
 		throw new TypeError('The `searchParams` option must not be `null`. Use `undefined` to clear it.');
 	}
@@ -44,7 +45,7 @@ export const hasSearchParameters = (search: SearchParamsOption): boolean => {
 	}
 
 	if (search instanceof URLSearchParams) {
-		return search.size > 0 || Boolean((search as any)[deletedParametersSymbol]?.size);
+		return search.size > 0 || Boolean((search as MarkedSearchParameters)[deletedParametersSymbol]?.size);
 	}
 
 	// Record

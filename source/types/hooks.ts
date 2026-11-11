@@ -1,13 +1,13 @@
-import {type stop, type RetryMarker} from '../core/constants.js';
+import {type stop, type RetryMarker, type beforeRetryOptionKeys} from '../core/constants.js';
 import type {KyRequest, KyResponse} from '../index.js';
-import type {InitOptions, NormalizedOptions} from './options.js';
+import type {InitOptions, NormalizedOptions, Options} from './options.js';
 
 /**
-This hook enables you to modify the options before they are used to construct the request. The hook function receives the mutable options object and can modify it in place. You could, for example, modify `searchParams`, `headers`, or `json` here. The `headers` option is always a plain object with lowercase names, where a header removed with `undefined` keeps an `undefined` value.
+This hook enables you to modify the options before they are used to construct the request. The hook function receives the mutable options object and can modify it in place. You could, for example, modify `searchParams`, `headers`, or `json` here. The `headers` option starts as a plain object with lowercase names, where a header removed with `undefined` keeps an `undefined` value.
 
-The `body` option is the exception: it is passed through by reference, so mutating a `FormData` or `URLSearchParams` body in place changes your own object and repeats on every request from the same instance. Replace `options.body` with a new instance instead, the way the `beforeRequest` workflow does.
+Ky gives the hook its own copies of `headers`, `context`, `json`, `searchParams` and `retry`, so changing them in place only affects the current request. The `context` copy is shallow, the same as in every other hook, so nested `context` values, such as a cache, stay shared across requests. The `body` option is not copied, so mutating a `FormData` or `URLSearchParams` body in place changes your own object and repeats on every request from the same instance. Assign a new instance instead, as shown in [Modifying FormData in hooks](https://github.com/sindresorhus/ky#modifying-formdata-in-hooks). A value that a hook assigns is used as is, so assign a new object rather than one that you change later.
 
-Unlike other hooks, `init` hooks are synchronous. Any error thrown will propagate synchronously and will not be caught by `beforeError` hooks.
+Unlike other hooks, `init` hooks are synchronous. An error thrown by one rejects the returned promise and is not passed to `beforeError` hooks.
 
 @example
 ```
@@ -52,7 +52,29 @@ export type BeforeRetryState = {
 	retryCount: number;
 };
 
-export type BeforeRetryHook = (state: BeforeRetryState) => Request | Response | typeof stop | void | Promise<Request | Response | typeof stop | void>;
+/**
+The value a `beforeRetry` hook can return to change options for this retry and the ones after it.
+
+@example
+```
+import ky, {type BeforeRetryUpdate} from 'ky';
+
+const withoutUploadProgress = (): BeforeRetryUpdate => ({options: {onUploadProgress: undefined}});
+
+await ky.put(uploadUrl, {
+	body: file,
+	onUploadProgress: updateProgress,
+	hooks: {
+		beforeRetry: [withoutUploadProgress],
+	},
+});
+```
+*/
+export type BeforeRetryUpdate = {
+	options: Pick<Options, typeof beforeRetryOptionKeys[number]>;
+};
+
+export type BeforeRetryHook = (state: BeforeRetryState) => Request | Response | BeforeRetryUpdate | typeof stop | void | Promise<Request | Response | BeforeRetryUpdate | typeof stop | void>;
 
 export type BeforeErrorState = {
 	request: KyRequest;
@@ -89,11 +111,11 @@ export type AfterResponseHook = (state: AfterResponseState) => Response | RetryM
 
 export type Hooks = {
 	/**
-	This hook enables you to modify the options before they are used to construct the request. The hook function receives the mutable options object and can modify it in place. You could, for example, modify `searchParams`, `headers`, or `json` here. The `headers` option is always a plain object with lowercase names, where a header removed with `undefined` keeps an `undefined` value.
+	This hook enables you to modify the options before they are used to construct the request. The hook function receives the mutable options object and can modify it in place. You could, for example, modify `searchParams`, `headers`, or `json` here. The `headers` option starts as a plain object with lowercase names, where a header removed with `undefined` keeps an `undefined` value.
 
-	Unlike other hooks, `init` hooks are synchronous. Any error thrown will propagate synchronously and will not be caught by `beforeError` hooks.
+	Ky gives the hook its own copies of `headers`, `context`, `json`, `searchParams` and `retry`, so changing them in place only affects the current request. The `context` copy is shallow, the same as in every other hook, so nested `context` values, such as a cache, stay shared across requests. The `body` option is not copied, so mutating a `FormData` or `URLSearchParams` body in place changes your own object and repeats on every request from the same instance. Assign a new instance instead, as shown in [Modifying FormData in hooks](https://github.com/sindresorhus/ky#modifying-formdata-in-hooks). A value that a hook assigns is used as is, so assign a new object rather than one that you change later.
 
-	The `body` option is passed through by reference, so mutating a `FormData` or `URLSearchParams` body in place changes your own object and repeats on every request from the same instance. Replace `options.body` with a new instance instead, the way the `beforeRequest` workflow does.
+	Unlike other hooks, `init` hooks are synchronous. An error thrown by one rejects the returned promise and is not passed to `beforeError` hooks.
 
 	A common use case is to add a search parameter to every request:
 
@@ -182,6 +204,32 @@ export type Hooks = {
 	If the request received a response, the error will be of type `HTTPError`. The `Response` object will be available at `error.response`, and the pre-parsed response body may be available at `error.data`. Be aware that some types of errors, such as network errors, inherently mean that a response was not received. In that case, the error will be an instance of `NetworkError` instead of `HTTPError`.
 
 	You can prevent Ky from retrying the request by throwing an error. Ky will not handle it in any way and the error will be propagated to the request initiator. The rest of the `beforeRetry` hooks will not be called in this case. Alternatively, you can return the [`ky.stop`](#kystop) symbol to do the same thing but without propagating an error (this has some limitations, see `ky.stop` docs for details).
+
+	**Changing options:**
+
+	Return `{options: {...}}` to change `onUploadProgress`, `onDownloadProgress`, `timeout`, `fetch`, or `throwHttpErrors` for this retry and the ones after it. Omitted options keep their value, and `undefined` restores Ky's default, not the value from `ky.create()` or `ky.extend()`. Any other option, or an invalid value, throws an error. The remaining `beforeRetry` hooks still run and see the new progress callbacks in `options`. The `options` a hook receives never include `timeout`, `fetch`, or `throwHttpErrors`.
+
+	For example, turn off upload progress after a network error. Upload progress needs a streamed request body, which Chromium only sends over HTTP/2 or HTTP/3, so the upload fails on an HTTP/1.1 connection. Only retry an upload when it is safe to send it again, since a network error does not tell whether the server got the request.
+
+	@example
+	```
+	import ky, {isNetworkError} from 'ky';
+
+	await ky.put(uploadUrl, {
+		body: file,
+		onUploadProgress: updateProgress,
+		retry: {limit: 1},
+		hooks: {
+			beforeRetry: [
+				({error}) => {
+					if (isNetworkError(error)) {
+						return {options: {onUploadProgress: undefined}};
+					}
+				}
+			]
+		}
+	});
+	```
 
 	**Modifying headers:**
 

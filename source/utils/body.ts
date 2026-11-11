@@ -1,14 +1,29 @@
-import type {Options, Progress} from '../types/options.js';
+import type {Options} from '../types/options.js';
 import {responseTypes, usualFormBoundarySize} from '../core/constants.js';
 import {ResponseSizeError} from '../errors/ResponseSizeError.js';
 
 const encoder = new TextEncoder();
 const responseSizeErrors = new WeakMap<ReadableStream, () => ResponseSizeError | undefined>();
-// Errors thrown by a progress callback, keyed by the stream the callback reports on.
-// A throwing progress callback is a user error, but the runtime reports the resulting stream failure as a network error, so Ky needs the original error to surface it as-is.
-const progressCallbackErrors = new WeakMap<ReadableStream, () => unknown>();
 // The `Response` constructor rejects a body for these statuses, but some browsers (for example, Chromium and WebKit) still expose a body stream on such responses, so they must not be wrapped. A runtime that exposes a non-empty body for one of them, such as WebKit for 205, is therefore left unlimited and without progress events.
 const nullBodyStatuses = new Set([101, 103, 204, 205, 304]);
+
+/**
+Cancels the body of a request or response that is no longer used, unless `keep` still reads the same stream.
+
+Fire-and-forget: cancellation failures from already-locked or already-consumed streams are ignored, and the cancellation is not awaited since a clone leaves extra tee branches that keep the cancel promise pending per the Streams spec.
+*/
+export const cancelBody = (value: Request | Response | undefined, keep?: Request | Response): void => {
+	const body = value?.body;
+	if (body && body !== keep?.body) {
+		void body.cancel().catch(() => undefined);
+	}
+};
+
+const getContentLength = (headers: Headers): number => Math.max(0, Number(headers.get('content-length')) || 0);
+
+// A multipart body sends every line break in a field name or string value as CRLF, and escapes line breaks and quotes in a field name or filename.
+const normalizeLineBreaks = (value: string): string => value.replaceAll(/\r\n|\r|\n/g, '\r\n');
+const escapeFormDataName = (name: string): string => name.replaceAll('\n', '%0A').replaceAll('\r', '%0D').replaceAll('"', '%22');
 
 // eslint-disable-next-line @typescript-eslint/no-restricted-types
 export const getBodySize = (body?: BodyInit | null): number => {
@@ -17,18 +32,28 @@ export const getBodySize = (body?: BodyInit | null): number => {
 	}
 
 	if (body instanceof FormData) {
-		// This is an approximation, as FormData size calculation is not straightforward
+		// This is an approximation, as FormData size calculation is not straightforward. The boundary length is a stand-in for the runtime's own, and every other byte is counted so the estimate errs high (except in Bun, see `usualFormBoundarySize`): an estimate below the real size makes `percent` reach its ceiling part way through the upload.
 		let size = 0;
 
 		for (const [key, value] of body) {
-			size += usualFormBoundarySize;
-			size += encoder.encode(`Content-Disposition: form-data; name="${key}"`).byteLength;
+			size += usualFormBoundarySize + 4; // `--<boundary>\r\n`
+			size += encoder.encode(`Content-Disposition: form-data; name="${escapeFormDataName(normalizeLineBreaks(key))}"`).byteLength;
+
+			if (value instanceof Blob) {
+				// Most runtimes turn an appended `Blob` into a `File` named `blob`, but Bun keeps a `Blob` with an `undefined` name and sends an empty filename.
+				size += encoder.encode(`; filename="${escapeFormDataName((value as Partial<File>).name ?? '')}"`).byteLength;
+				size += encoder.encode(`\r\nContent-Type: ${value.type || 'application/octet-stream'}`).byteLength;
+			}
+
+			size += 4; // The CRLF that ends the headers, plus the blank line.
 			size += typeof value === 'string'
-				? encoder.encode(value).byteLength
+				? encoder.encode(normalizeLineBreaks(value)).byteLength
 				: value.size;
+			size += 2; // The CRLF that ends the part.
 		}
 
-		return size;
+		// The closing `--<boundary>--\r\n`. An empty `FormData` still sends it, but reports `0`, the documented total for an empty transfer.
+		return size === 0 ? 0 : size + usualFormBoundarySize + 6;
 	}
 
 	if (body instanceof Blob) {
@@ -53,19 +78,8 @@ export const getBodySize = (body?: BodyInit | null): number => {
 const withProgress = (stream: ReadableStream<Uint8Array>, totalBytes: number, onProgress: Options['onDownloadProgress'] | Options['onUploadProgress']): ReadableStream<Uint8Array> => {
 	let previousChunk: Uint8Array | undefined;
 	let transferredBytes = 0;
-	let progressCallbackError: unknown;
-	const report = (progress: Progress, chunk: Uint8Array) => {
-		try {
-			onProgress?.(progress, chunk);
-		} catch (error) {
-			// Remember the error so Ky can surface it instead of the network error the runtime reports for the failed stream.
-			progressCallbackError = error;
-			throw error;
-		}
-	};
 
-	// The transformer only runs after construction, so its error accessor can be registered immediately afterwards.
-	const progressStream: ReadableStream<Uint8Array> = stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+	return stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
 		transform(currentChunk, controller) {
 			controller.enqueue(currentChunk);
 
@@ -82,7 +96,7 @@ const withProgress = (stream: ReadableStream<Uint8Array>, totalBytes: number, on
 
 				// An unknown total stays `0`, matching the `percent` computed from the same estimate and the documented progress shape.
 				const reportedTotalBytes = totalBytes === 0 ? 0 : Math.max(totalBytes, transferredBytes);
-				report({percent, totalBytes: reportedTotalBytes, transferredBytes}, previousChunk);
+				onProgress?.({percent, totalBytes: reportedTotalBytes, transferredBytes}, previousChunk);
 			}
 
 			previousChunk = currentChunk;
@@ -90,29 +104,13 @@ const withProgress = (stream: ReadableStream<Uint8Array>, totalBytes: number, on
 		flush() {
 			const finalChunk = previousChunk ?? new Uint8Array();
 			transferredBytes += finalChunk.byteLength;
-			report({percent: 1, totalBytes: transferredBytes, transferredBytes}, finalChunk);
+			onProgress?.({percent: 1, totalBytes: transferredBytes, transferredBytes}, finalChunk);
 		},
 	}));
-	progressCallbackErrors.set(progressStream, () => progressCallbackError);
-
-	return progressStream;
 };
-
-/**
-The error thrown by a progress callback while reporting on the given stream, if the callback threw.
-*/
-export const getProgressCallbackError = (stream: ReadableStream | undefined): unknown =>
-	stream ? progressCallbackErrors.get(stream)?.() : undefined;
 
 const copyResponseMetadata = (response: Response, originalResponse: Response, getError = originalResponse.body ? responseSizeErrors.get(originalResponse.body) : undefined): Response => {
 	const nativeClone = response.clone.bind(response);
-	const getProgressError = response.body
-		? progressCallbackErrors.get(response.body) ?? (originalResponse.body ? progressCallbackErrors.get(originalResponse.body) : undefined)
-		: undefined;
-	if (response.body && getProgressError) {
-		progressCallbackErrors.set(response.body, getProgressError);
-	}
-
 	if (response.body && getError) {
 		responseSizeErrors.set(response.body, getError);
 
@@ -150,13 +148,9 @@ const copyResponseMetadata = (response: Response, originalResponse: Response, ge
 		clone: {
 			value() {
 				const clone = nativeClone();
-				// Cloning replaces the original body too, so retain the error accessors on both branches.
+				// Cloning replaces the original body too, so retain the error accessor on both branches.
 				if (response.body && getError) {
 					responseSizeErrors.set(response.body, getError);
-				}
-
-				if (response.body && getProgressError) {
-					progressCallbackErrors.set(response.body, getProgressError);
 				}
 
 				return copyResponseMetadata(clone, response);
@@ -169,17 +163,26 @@ const copyResponseMetadata = (response: Response, originalResponse: Response, ge
 	return response;
 };
 
+// The body of a response the two wrappers below can pipe through, or `undefined` when they must leave it alone. A body an `afterResponse` hook already read, or locked with a reader, would otherwise fail with "The ReadableStream is locked" instead of the native "Body is unusable" error that names the actual mistake. A null body status cannot be given a replacement body at all, and there is nothing left to report once the body is gone.
+const wrappableBody = (response: Response): ReadableStream<Uint8Array> | undefined => {
+	const {body} = response;
+	if (!body || response.bodyUsed || body.locked || nullBodyStatuses.has(response.status)) {
+		return undefined;
+	}
+
+	return body;
+};
+
 export const limitResponseSize = (response: Response, request: Request, maxResponseSize: number): Response => {
-	// A body a hook already read, or locked with a reader, cannot be piped through, and would otherwise fail with
-	// "The ReadableStream is locked" instead of the native "Body is unusable" error that names the actual mistake.
-	if (!response.body || response.bodyUsed || response.body.locked || nullBodyStatuses.has(response.status) || maxResponseSize === Number.POSITIVE_INFINITY) {
+	const originalBody = wrappableBody(response);
+	if (!originalBody || maxResponseSize === Number.POSITIVE_INFINITY) {
 		return response;
 	}
 
 	let transferredBytes = 0;
 	let sizeError: ResponseSizeError | undefined;
-	const getOriginalSizeError = responseSizeErrors.get(response.body);
-	const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+	const getOriginalSizeError = responseSizeErrors.get(originalBody);
+	const body = originalBody.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
 		transform(chunk, controller) {
 			transferredBytes += chunk.byteLength;
 			if (transferredBytes > maxResponseSize) {
@@ -195,32 +198,37 @@ export const limitResponseSize = (response: Response, request: Request, maxRespo
 };
 
 export const streamResponse = (response: Response, onDownloadProgress: Options['onDownloadProgress']) => {
-	// A response with no body at all is not streamed. That covers a null body status and a `HEAD` request, which has
-	// no body even on an ordinary status, so neither reports progress.
-	// See `limitResponseSize`: there is nothing left to stream and nothing to report once a hook consumed the body.
-	if (!response.body || response.bodyUsed || response.body.locked || nullBodyStatuses.has(response.status)) {
+	// A response with no wrappable body is not streamed, so it reports no progress. That covers a null body status, and a `HEAD` response in runtimes that give it no body.
+	const originalBody = wrappableBody(response);
+	if (!originalBody) {
 		return response;
 	}
 
 	// `content-length` counts encoded bytes on the wire, while the progress stream counts the bytes after decompression. Using it for a content-coded response would report a total below what actually arrives, so every event would sit at ~100%. The total is then unknown, which `Progress` already models with `0`. `identity` is a registered no-op coding (RFC 9110 §8.4.2), so it leaves the length valid.
 	const contentEncoding = response.headers.get('content-encoding')?.toLowerCase();
 	const isContentCoded = Boolean(contentEncoding) && contentEncoding !== 'identity';
-	const totalBytes = isContentCoded ? 0 : Math.max(0, Number(response.headers.get('content-length')) || 0);
-	const body = withProgress(response.body, totalBytes, onDownloadProgress);
+	const totalBytes = isContentCoded ? 0 : getContentLength(response.headers);
+	const body = withProgress(originalBody, totalBytes, onDownloadProgress);
 
 	return copyResponseMetadata(new Response(body, response), response);
 };
 
 // eslint-disable-next-line @typescript-eslint/no-restricted-types
 export const streamRequest = (request: Request, onUploadProgress: Options['onUploadProgress'], originalBody?: BodyInit | null) => {
-	// A Request-like object from a hook is used as-is, because the `Request` constructor cannot copy it. It would stringify the object as a URL here, so progress reporting is skipped for it.
-	if (!request.body || request.keepalive || request.mode === 'no-cors' || !(request instanceof globalThis.Request)) {
+	// A Request-like object from a hook is used as-is, because the `Request` constructor cannot copy it. It would stringify the object as a URL here, so progress reporting is skipped for it. A body a hook already read, or locked with a reader, is left alone for the same reason as a response body: the runtime's own error names the actual mistake, where piping it would fail with "The ReadableStream is locked".
+	if (
+		!request.body
+		|| request.bodyUsed
+		|| request.body.locked
+		|| request.keepalive
+		|| request.mode === 'no-cors'
+		|| !(request instanceof globalThis.Request)
+	) {
 		return request;
 	}
 
 	// Use original body for size calculation since request.body is already a stream. A `ReadableStream` measures 0, so fall back to a `content-length` the caller declared. Browsers drop that header from a request, so this only helps outside browsers.
-	const totalBytes = getBodySize(originalBody ?? request.body)
-		|| Math.max(0, Number(request.headers.get('content-length')) || 0);
+	const totalBytes = getBodySize(originalBody ?? request.body) || getContentLength(request.headers);
 
 	return new Request(request, {
 		// @ts-expect-error - Types are outdated.

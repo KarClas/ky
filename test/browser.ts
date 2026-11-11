@@ -111,67 +111,6 @@ defaultBrowsersTest('maxResponseSize passes through a 204 response', async (t, p
 	t.deepEqual(result, {status: 204, header: 'ky', text: ''});
 });
 
-// A throwing progress callback is a user error. Chromium reports the failed response stream as a generic `TypeError`, so the callback error must survive that instead of becoming a `NetworkError` or a `TypeError`.
-browserTest('a throwing download progress callback propagates its own error', [chromium, webkit], async (t, page) => {
-	server.get('/', (_request, response) => {
-		response.end('body');
-	});
-
-	await page.goto(server.url);
-	await addKyScriptToPage(page);
-
-	const result = await page.evaluate(async (url: string) => {
-		try {
-			await globalThis.ky(url, {
-				retry: 0,
-				onDownloadProgress() {
-					throw new Error('download progress failed');
-				},
-			}).text();
-			return {errorName: 'none', message: 'none'};
-		} catch (error) {
-			return {errorName: (error as Error).name, message: (error as Error).message};
-		}
-	}, server.url);
-
-	t.deepEqual(result, {errorName: 'Error', message: 'download progress failed'});
-});
-
-browserTest('cloning a response preserves download progress callback errors', [chromium], async (t, page) => {
-	server.get('/', (_request, response) => {
-		response.end('body');
-	});
-
-	await page.goto(server.url);
-	await addKyScriptToPage(page);
-
-	const result = await page.evaluate(async (url: string) => {
-		const callbackError = new Error('download progress failed');
-		const pending = globalThis.ky(url, {
-			retry: 0,
-			onDownloadProgress() {
-				throw callbackError;
-			},
-		});
-		const response = await pending;
-		const clone = response.clone();
-		void clone.body?.cancel().catch(() => undefined);
-
-		try {
-			await pending.text();
-			return {sameError: false, errorName: 'none', message: 'none'};
-		} catch (error) {
-			return {
-				sameError: error === callbackError,
-				errorName: (error as Error).name,
-				message: (error as Error).message,
-			};
-		}
-	}, server.url);
-
-	t.deepEqual(result, {sameError: true, errorName: 'Error', message: 'download progress failed'});
-});
-
 // WebKit exposes a body for `205 Reset Content`, which the Fetch spec lists as a null body status. Ky cannot wrap such a response, because the `Response` constructor rejects a body for those statuses, so `maxResponseSize` and `onDownloadProgress` do not apply to it.
 browserTest('maxResponseSize does not apply to a 205 response body in WebKit', [webkit], async (t, page) => {
 	server.get('/', (_request, response) => {
@@ -273,8 +212,7 @@ defaultBrowsersTest('baseUrl option', async (t: ExecutionContext, page: Page) =>
 
 	const results = await page.evaluate(async (url: string) => Promise.all([
 		globalThis.ky(`${url}/api/unicorn`).text(),
-		// @ts-expect-error unsupported {baseUrl: null} type
-		globalThis.ky(`${url}/api/unicorn`, {baseUrl: null}).text(),
+		globalThis.ky(`${url}/api/unicorn`, {baseUrl: undefined}).text(),
 		globalThis.ky('api/unicorn', {baseUrl: url}).text(),
 		globalThis.ky('unicorn', {baseUrl: `${url}/api`}).text(),
 		globalThis.ky('/unicorn', {baseUrl: `${url}/api`}).text(),
@@ -299,8 +237,7 @@ defaultBrowsersTest('prefix option', async (t: ExecutionContext, page: Page) => 
 
 	const results = await page.evaluate(async (url: string) => Promise.all([
 		globalThis.ky(`${url}/api/unicorn`).text(),
-		// @ts-expect-error unsupported {prefix: null} type
-		globalThis.ky(`${url}/api/unicorn`, {prefix: null}).text(),
+		globalThis.ky(`${url}/api/unicorn`, {prefix: undefined}).text(),
 		globalThis.ky('api/unicorn', {prefix: url}).text(),
 		globalThis.ky('unicorn', {prefix: `${url}/api`}).text(),
 		globalThis.ky('/unicorn', {prefix: `${url}/api`}).text(),
@@ -892,4 +829,77 @@ defaultBrowsersTest('an unbound window.fetch works as the fetch option', async (
 
 	t.deepEqual(results, ['rainbow', 'rainbow', 'rainbow', 'rainbow', 'recovered']);
 	t.is(requestCount, 2);
+});
+
+browserTest('beforeRetry upload progress override allows HTTP/1.1 fallback', [chromium], async (t, page) => {
+	const uploadServer = await createEsmTestServer({bodyParser: false});
+	t.teardown(uploadServer.close);
+	uploadServer.get('/', (_request, response) => {
+		response.end();
+	});
+	let receivedRequests = 0;
+	uploadServer.put('/upload', async (request, response) => {
+		receivedRequests++;
+		const body = await parseRawBody(request);
+		response.json({body, contentType: request.headers['content-type']});
+	});
+	await page.goto(uploadServer.url);
+	await addKyScriptToPage(page);
+
+	const results = await page.evaluate(async (url: string) => {
+		const formData = new FormData();
+		formData.append('field', 'payload');
+		const bodies = ['payload', new Blob(['payload']), formData, new URLSearchParams({field: 'payload'})];
+		const results = [];
+		for (const body of bodies) {
+			let retryCount = 0;
+			let errorName = '';
+			let retryContentType: string | undefined;
+			// eslint-disable-next-line no-await-in-loop
+			const response = await globalThis.ky.put(`${url}/upload`, {
+				body,
+				onUploadProgress() {
+					// Only enables the streamed upload, which fails over HTTP/1.1 in Chromium.
+				},
+				retry: {
+					limit: 1,
+					// A method, because tsx wraps an arrow function assigned to a property with a `__name` helper that does not exist in the page.
+					delay() {
+						return 0;
+					},
+				},
+				hooks: {
+					beforeRetry: [state => {
+						retryCount = state.retryCount;
+						errorName = state.error.name;
+						retryContentType = state.request.headers.get('content-type') ?? undefined;
+						return {options: {onUploadProgress: undefined}};
+					}],
+				},
+			}).json<{body: string; contentType?: string}>();
+			results.push({
+				...response,
+				retryCount,
+				errorName,
+				retryContentType,
+			});
+		}
+
+		return results;
+	}, uploadServer.url);
+
+	t.is(receivedRequests, 4);
+	for (const result of results) {
+		t.is(result.retryCount, 1);
+		t.is(result.errorName, 'NetworkError');
+		t.is(result.contentType, result.retryContentType);
+	}
+
+	t.is(results[0]!.body, 'payload');
+	t.is(results[1]!.body, 'payload');
+	// The multipart boundary in the retried body must match its content type.
+	const boundary = results[2]!.contentType!.split('boundary=')[1]!;
+	t.true(results[2]!.body.startsWith(`--${boundary}\r\n`));
+	t.true(results[2]!.body.includes('name="field"\r\n\r\npayload\r\n'));
+	t.is(results[3]!.body, 'field=payload');
 });

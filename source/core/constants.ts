@@ -54,10 +54,15 @@ export const responseTypes = {
 	bytes: '*/*',
 } as const;
 
+// Only expose `.bytes()` when the environment implements it. Checked on each call, so a polyfill added after Ky is imported still counts.
+export const getSupportedResponseTypes = (): Array<keyof typeof responseTypes> =>
+	(Object.keys(responseTypes) as Array<keyof typeof responseTypes>).filter(type =>
+		type !== 'bytes' || typeof (globalThis.Response?.prototype as unknown as {bytes?: unknown})?.bytes === 'function');
+
 // The maximum value of a 32bit int (see issue #117)
 export const maxSafeTimeout = 2_147_483_647;
 
-// Size in bytes of a typical form boundary (e.g., '------WebKitFormBoundaryaxpyiPgbbPti10Rw'), used to help estimate upload size
+// Size in bytes of a typical form boundary (e.g., '------WebKitFormBoundaryaxpyiPgbbPti10Rw'), used to help estimate upload size. Bun's boundary is 54 bytes, so there the estimate runs 14 bytes low for each part and once more for the closing boundary. That is negligible next to a file, but for a body of many small fields `percent` can reach its ceiling before the upload ends. The final event always reports the real total.
 export const usualFormBoundarySize = 40;
 
 /**
@@ -78,14 +83,14 @@ export type ForceRetryOptions = {
 
 	**Note:** Custom delays bypass jitter and `backoffLimit`. This is intentional, as custom delays often come from server responses (e.g., `Retry-After` headers) and should be respected exactly as specified.
 
-	Must be a non-negative number, or `undefined`; anything else throws a `TypeError` rather than collapsing to a 1ms retry.
+	Must be a non-negative number, `Infinity` included, or `undefined`; anything else makes the request throw a `TypeError` rather than collapsing to a 1ms retry.
 	*/
 	delay?: number | undefined;
 
 	/**
 	Error code for the retry.
 
-	This machine-readable identifier will be included in the error message passed to `beforeRetry` hooks, allowing you to distinguish between different types of forced retries.
+	This machine-readable identifier will be included in the error message passed to `beforeRetry` hooks, allowing you to distinguish between different types of forced retries. Anything other than a string makes the request throw a `TypeError`.
 
 	@example
 	```
@@ -118,7 +123,7 @@ export type ForceRetryOptions = {
 	/**
 	Custom request to use for the retry.
 
-	This allows you to modify or completely replace the request during a forced retry. The custom request becomes the starting point for the retry - `beforeRetry` hooks can still further modify it if needed.
+	This allows you to modify or completely replace the request during a forced retry. The custom request becomes the starting point for the retry - `beforeRetry` hooks can still further modify it if needed. Anything other than a `Request` or `undefined` makes the request throw a `TypeError`.
 
 	**Note:** The custom request's `signal` will be replaced with Ky's managed signal to handle timeouts and user-provided abort signals correctly. If the original request body has been consumed, you must provide a new body or clone the request before consuming.
 
@@ -174,6 +179,8 @@ export const isRetryMarker = (value: unknown): value is RetryMarker =>
 Force a retry from an `afterResponse` hook.
 
 This allows you to retry a request based on the response content, even if the response has a successful status code. The retry will respect the `retry.limit` option and skip the `shouldRetry` check. The forced retry is observable in `beforeRetry` hooks, where the error will be a `ForceRetryError`.
+
+A marker returned by a second copy of Ky, which happens with a duplicated dependency, is still recognised, the same way the Ky error guards accept branded errors.
 
 @param options - Optional configuration for the retry.
 
@@ -254,6 +261,9 @@ const response = await api.get('https://example.com/api');
 ```
 */
 export const retry = (options?: ForceRetryOptions) => new RetryMarker(options);
+
+// Ky reads these again for every attempt, so a `beforeRetry` hook can change them without rebuilding the request.
+export const beforeRetryOptionKeys = ['onUploadProgress', 'onDownloadProgress', 'timeout', 'fetch', 'throwHttpErrors'] as const;
 
 export const kyOptionKeys: KyOptionsRegistry = {
 	json: true,

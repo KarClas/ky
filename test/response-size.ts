@@ -19,16 +19,14 @@ for (const maxResponseSize of [0, 4, Number.POSITIVE_INFINITY]) {
 }
 
 for (const maxResponseSize of [-1, 1.5, Number.NaN, Number.NEGATIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, '4', null]) {
-	test(`rejects invalid maxResponseSize: ${String(maxResponseSize)}`, t => {
-		t.throws(() => {
-			void ky(url, {
-				maxResponseSize: maxResponseSize as number,
-				async fetch() {
-					t.fail('Should validate before fetching');
-					return new Response();
-				},
-			});
-		}, {instanceOf: TypeError});
+	test(`rejects invalid maxResponseSize: ${String(maxResponseSize)}`, async t => {
+		await t.throwsAsync(ky(url, {
+			maxResponseSize: maxResponseSize as number,
+			async fetch() {
+				t.fail('Should validate before fetching');
+				return new Response();
+			},
+		}), {instanceOf: TypeError});
 	});
 }
 
@@ -568,3 +566,4 @@ test('response headers stay immutable without the wrapping options', async t => 
 		response.headers.set('x-injected', '1');
 	}, {instanceOf: TypeError});
 });
+

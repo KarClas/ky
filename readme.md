@@ -98,6 +98,8 @@ Returns a [`Response` object](https://developer.mozilla.org/en-US/docs/Web/API/R
 
 Available body shortcuts: `.json()`, `.text()`, `.formData()`, `.arrayBuffer()`, `.blob()`, and `.bytes()`. The `.bytes()` shortcut is only present when the runtime supports `Response.prototype.bytes()`.
 
+Invalid options, an invalid `input`, and an error thrown by an `init` hook reject the returned promise instead of throwing, the same way `fetch()` reports them. They are not passed to `beforeError` hooks, because no request was made.
+
 ```js
 import ky from 'ky';
 
@@ -278,6 +280,8 @@ If `retry` is a number, it will be used as `limit` and other defaults will remai
 
 Network errors (e.g., DNS failures, connection refused, offline) are automatically retried for retriable methods. Only errors recognized as network errors are retried; other errors (e.g., programming bugs) are thrown immediately. Use `shouldRetry` to customize this behavior.
 
+A hook can change `retry.limit` through `options`. Ky reads the limit again when each attempt starts. A `beforeRequest` or `beforeRetry` hook runs before the attempt starts, so it can lower or raise the limit. An `afterResponse` hook runs after the attempt started, so it can lower the limit, for example to stop retrying once a response says so. A higher limit set there only applies from the next attempt.
+
 `413 Payload Too Large` is only retried when the response includes a retry timing header, unless `shouldRetry` returns `true`.
 
 When the response status is contained in `afterStatusCodes` and the retry is allowed by `statusCodes` or `shouldRetry`, Ky uses retry timing headers to choose the retry delay. [`Retry-After`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After) may provide a delay in seconds or an HTTP-date. If `Retry-After` is missing, Ky falls back to rate-limit timing headers (`RateLimit-Reset`, `X-RateLimit-Retry-After`, `X-RateLimit-Reset`, and `X-Rate-Limit-Reset`). Numeric `Retry-After` and `X-RateLimit-Retry-After` values are interpreted as delay seconds. Numeric `RateLimit-Reset`, `X-RateLimit-Reset`, and `X-Rate-Limit-Reset` values may also be interpreted as Unix timestamps, from 2001-09-09 onwards. A value below that is read as delay seconds, and a timestamp already in the past means the retry happens immediately. If the status code is not in `afterStatusCodes`, retry timing headers will be ignored.
@@ -289,7 +293,7 @@ To clamp the delay, set `backoffLimit` to 1000, for example.
 A delay from a retry timing header is not subject to this limit; use `maxRetryAfter` to bound it.
 By default, the delay is calculated with `0.3 * (2 ** (attemptCount - 1)) * 1000`. The delay increases exponentially.
 
-The `delay` option can be used to change how the delay between retries is calculated. The function receives one parameter, the attempt count, starting at `1`, and must return the delay in milliseconds.
+The `delay` option can be used to change how the delay between retries is calculated. The function receives one parameter, the attempt count, starting at `1`, and must return the delay in milliseconds. A value that is not a non-negative number or `Infinity` throws a `TypeError` rather than collapsing to a 1ms retry, and the error that was being retried is kept as its `cause` so `beforeError` can still reach it.
 
 The `jitter` option adds random jitter to retry delays to prevent thundering herd problems. When many clients retry simultaneously (e.g., after hitting a rate limit), they can overwhelm the server again. Jitter adds randomness to break this synchronization. Set to `true` to use full jitter, which randomizes the delay between 0 and the computed delay. Alternatively, pass a function to implement custom jitter strategies.
 
@@ -402,16 +406,18 @@ const json = await ky('https://example.com', {
 Type: `number | false`\
 Default: `10000`
 
-Per-attempt timeout in milliseconds for getting a response, applied independently to each retry. Ky shortcut methods also use this value as a separate timeout for reading the response body. Cannot be greater than 2147483647. See also [`totalTimeout`](#totaltimeout).
+Per-attempt timeout in milliseconds for getting a response, applied independently to each retry. Ky shortcut methods also use this value as a separate timeout for reading the response body. Must be a non-negative number or `false`, or a `TypeError` is thrown. A value greater than 2147483647, `Infinity` included, throws a `RangeError`. See also [`totalTimeout`](#totaltimeout).
 
 If set to `false`, there will be no per-attempt timeout.
+
+If the signal you passed in is aborted while a body method is reading, or just after the read finished, the body method rejects with the abort reason rather than resolving with the bytes that already arrived.
 
 ##### totalTimeout
 
 Type: `number | false`\
 Default: `false`
 
-Overall timeout in milliseconds for the entire operation, including retries and delays. Throws a `TimeoutError` if exceeded. Cannot be greater than 2147483647.
+Overall timeout in milliseconds for the entire operation, including retries and delays. Throws a `TimeoutError` if exceeded. Must be a non-negative number or `false`, or a `TypeError` is thrown. A value greater than 2147483647, `Infinity` included, throws a `RangeError`.
 
 `beforeError` hooks run after an error is produced and are not bounded by `totalTimeout`.
 
@@ -452,6 +458,16 @@ const data = await ky('https://example.com/data', {
 }).json();
 ```
 
+##### dispatcher
+
+An [undici](https://github.com/nodejs/undici) `Agent` or `Dispatcher`, forwarded to `fetch()` as-is. Ky does not use it, it just passes it through.
+
+##### next
+
+A framework-specific fetch extension, such as [Next.js's `next`](https://nextjs.org/docs/app/api-reference/functions/next#options), forwarded to `fetch()` as-is.
+
+Ky forwards every option it does not recognize to `fetch()`. The type of such an option comes from the global `RequestInit` type, which `@types/node` extends with `dispatcher` and Next.js extends with `next`. An extension that your environment does not declare needs a type assertion.
+
 ##### hooks
 
 Type: `object<string, Function[]>`\
@@ -459,16 +475,18 @@ Default: `{init: [], beforeRequest: [], beforeRetry: [], beforeError: [], afterR
 
 Hooks allow modifications during the request lifecycle. Hook functions may be async and are run serially, unless otherwise noted.
 
+Each hook must be an array of functions. A single function, a string, or any other value, `null` included, throws a `TypeError` rather than being silently dropped. `undefined` means absent, so it clears the hooks it would have replaced.
+
 ###### hooks.init
 
 Type: `Function[]`\
 Default: `[]`
 
-This hook enables you to modify the options before they are used to construct the request. The hook function receives the mutable options object and can modify it in place. You could, for example, modify `searchParams`, `headers`, or `json` here. The `headers` option is always a plain object with lowercase names, where a header removed with `undefined` keeps an `undefined` value.
+This hook enables you to modify the options before they are used to construct the request. The hook function receives the mutable options object and can modify it in place. You could, for example, modify `searchParams`, `headers`, or `json` here. The `headers` option starts as a plain object with lowercase names, where a header removed with `undefined` keeps an `undefined` value.
 
-Unlike other hooks, `init` hooks are synchronous. Any error thrown will propagate synchronously and will not be caught by `beforeError` hooks.
+Ky gives the hook its own copies of `headers`, `context`, `json`, `searchParams` and `retry`, so changing them in place only affects the current request. The `context` copy is shallow, the same as in every other hook, so nested `context` values, such as a cache, stay shared across requests. The `body` option is not copied, so mutating a `FormData` or `URLSearchParams` body in place changes your own object and repeats on every request from the same instance. Assign a new instance instead, as shown in [Modifying FormData in hooks](#modifying-formdata-in-hooks). A value that a hook assigns is used as is, so assign a new object rather than one that you change later.
 
-The `body` option is the exception: it is passed through by reference, so mutating a `FormData` or `URLSearchParams` body in place changes your own object and repeats on every request from the same instance. Replace `options.body` with a new instance instead, the way the [`beforeRequest`](#hooksbeforerequest) workflow does.
+Unlike other hooks, `init` hooks are synchronous. An error thrown by one rejects the returned promise and is not passed to `beforeError` hooks.
 
 A common use case is to add a search parameter to every request:
 
@@ -555,6 +573,31 @@ The `retryCount` is always `>= 1`, since this hook is only called during retries
 If the request received a response, the error will be of type `HTTPError`. The `Response` object will be available at `error.response`, and the pre-parsed response body may be available at `error.data`. Be aware that some types of errors, such as network errors, inherently mean that a response was not received. In that case, the error will be an instance of `NetworkError` instead of `HTTPError`.
 
 You can prevent Ky from retrying the request by throwing an error. Ky will not handle it in any way and the error will be propagated to the request initiator. The rest of the `beforeRetry` hooks will not be called in this case. Alternatively, you can return the [`ky.stop`](#kystop) symbol to do the same thing but without propagating an error (this has some limitations, see `ky.stop` docs for details).
+
+**Changing options:**
+
+Return `{options: {...}}` to change `onUploadProgress`, `onDownloadProgress`, `timeout`, `fetch`, or `throwHttpErrors` for this retry and the ones after it. Omitted options keep their value, and `undefined` restores Ky's default, not the value from `ky.create()` or `ky.extend()`. Any other option, or an invalid value, throws an error. The remaining `beforeRetry` hooks still run and see the new progress callbacks in `options`. The `options` a hook receives never include `timeout`, `fetch`, or `throwHttpErrors`.
+
+For example, turn off upload progress after a network error. Upload progress needs a streamed request body, which Chromium only sends over HTTP/2 or HTTP/3, so the upload fails on an HTTP/1.1 connection. Only retry an upload when it is safe to send it again, since a network error does not tell whether the server got the request.
+
+```js
+import ky, {isNetworkError} from 'ky';
+
+await ky.put(uploadUrl, {
+	body: file,
+	onUploadProgress: updateProgress,
+	retry: {limit: 1},
+	hooks: {
+		beforeRetry: [
+			({error}) => {
+				if (isNetworkError(error)) {
+					return {options: {onUploadProgress: undefined}};
+				}
+			}
+		]
+	}
+});
+```
 
 **Modifying headers:**
 
@@ -762,11 +805,11 @@ The function receives these arguments:
   - `totalBytes` is the total number of bytes to be transferred. This is an estimate and may be 0 for an empty transfer or when the total size cannot be determined.
 - `chunk` is an instance of `Uint8Array` containing the data that was received. When an empty response body stream completes, the callback receives an empty chunk.
 
-`content-length` is only used as the total for a response that is not content-coded, since it counts encoded bytes while the progress stream counts the bytes after decompression. A compressed response therefore reports `totalBytes: 0` until it completes, so the percentage cannot be calculated while downloading.
+`content-length` is only used as the total for a response that is not content-coded, since it counts encoded bytes while the progress stream counts the bytes after decompression. A compressed response therefore reports `totalBytes: 0` until it completes, so the percentage cannot be calculated while downloading. For a cross-origin response in a browser, `content-encoding` is only visible when the server lists it in `Access-Control-Expose-Headers`. Otherwise Ky cannot tell that the response is compressed, so it uses `content-length` and the percentage stays close to 100% for most of the download.
 
-Responses with no body at all are not streamed, so no progress events are emitted for them. That covers a [null body status](https://fetch.spec.whatwg.org/#null-body-status) such as `204`, and a `HEAD` request, which has no body even on an ordinary status. A response whose body an `afterResponse` hook already read, or locked with a reader, is passed through unchanged, so it reports no progress either.
+Responses with no body at all are not streamed, so no progress events are emitted for them. That covers a [null body status](https://fetch.spec.whatwg.org/#null-body-status) such as `204`, and a `HEAD` response in runtimes that give it no body, such as browsers, Node.js and Deno. Bun gives a `HEAD` response an empty body, so it reports one final event with `transferredBytes: 0`. A response whose body an `afterResponse` hook already read, or locked with a reader, is passed through unchanged, so it reports no progress either.
 
-When the callback throws, the error is reported by Ky's body method shortcuts. A response read directly with `response.text()` or `response.json()` may instead report the runtime's own stream error, such as Chromium's generic `TypeError`.
+Do not throw from the callback. A throw fails the response stream, which the runtime reports in its own way: Node.js rejects the body read with your error, while Chromium reports a network failure, so Ky's body methods throw a `NetworkError` there. Pass a `signal` from an `AbortController` to cancel instead.
 
 ```js
 import ky from 'ky';
@@ -787,7 +830,7 @@ Type: `Function`
 Upload progress event handler.
 
 > [!NOTE]
-> Requires [request stream support](https://caniuse.com/wf-fetch-request-streams) and, in Chromium-based browsers, an HTTP/2 or HTTP/3 connection (streaming uploads over HTTP/1.1 fail with a network error, even over plain HTTP). This handler is silently ignored in unsupported environments and for requests with `keepalive: true` or `mode: 'no-cors'`, since they cannot use streaming request bodies.
+> Requires [request stream support](https://caniuse.com/wf-fetch-request-streams) and, in Chromium-based browsers, an HTTP/2 or HTTP/3 connection (streaming uploads over HTTP/1.1 fail with a network error, even over plain HTTP). This handler is silently ignored in unsupported environments and for requests with `keepalive: true` or `mode: 'no-cors'`, since they cannot use streaming request bodies. If an upload fails over HTTP/1.1 in Chromium, you can retry it without upload progress by returning `{options: {onUploadProgress: undefined}}` from a [`beforeRetry`](#hooksbeforeretry) hook.
 
 The function receives these arguments:
 - `progress` is an object with these properties:
@@ -796,7 +839,9 @@ The function receives these arguments:
   - `totalBytes` is the total number of bytes to be transferred. This is an estimate and may be 0 for an empty transfer or when the total size cannot be determined.
 - `chunk` is an instance of `Uint8Array` containing the data that was sent. When an empty request body stream completes, the callback receives an empty chunk.
 
-A `ReadableStream` body cannot be measured, so `totalBytes` falls back to a `content-length` header you set. Browsers do not allow that header on a request, so there the total stays `0`.
+A `ReadableStream` body cannot be measured, so `totalBytes` falls back to a `content-length` header you set. Browsers do not allow that header on a request, so there the total stays `0`. When a hook replaces the request, `totalBytes` is still estimated from the `body` option until the final event, which reports the real total.
+
+Do not throw from the callback. A throw fails the upload stream, which the runtime reports as a network failure, so Ky throws a `NetworkError` (in Node.js, with your error in its `cause` chain) and retries it like any other network error, running the callback again. Pass a `signal` from an `AbortController` to cancel instead.
 
 ```js
 import ky from 'ky';
@@ -876,7 +921,7 @@ Type: `Function`\
 Default: `fetch`
 
 User-defined `fetch` function.
-Has to be fully compatible with the [Fetch API](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API) standard.
+Has to be fully compatible with the [Fetch API](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API) standard. It must resolve with a `Response`, or a `TypeError` is thrown.
 
 Use-cases:
 1. Use the `fetch` wrapper function provided by some frameworks that use server-side rendering (SSR).
@@ -914,8 +959,6 @@ Use cases:
 - Pass serverless environment bindings (e.g., Cloudflare Workers)
 
 **Note:** Context is shallow merged. Top-level properties are merged, but nested objects are replaced. Only enumerable properties are copied.
-
-**Note:** Each request gets its own deep copy of the context, so a hook that mutates a nested plain object or array cannot write back to the instance defaults or to the object you passed in. Non-plain values such as class instances are shared by reference. A hook that caches data in the context, for example with `options.context.token ??= await getToken()`, therefore recomputes it once per request rather than once per instance.
 
 ```js
 import ky from 'ky';
@@ -968,7 +1011,7 @@ Create a new `ky` instance with some defaults overridden with your own.
 
 In contrast to `ky.create()`, `ky.extend()` inherits defaults from its parent.
 
-You can pass headers as a `Headers` instance or a plain object. Headers are normalized to a plain object with lowercase names when options are merged, so `init` hooks always see a plain object with lowercase keys. A header removed with `undefined` stays in that object with an `undefined` value.
+You can pass headers as a `Headers` instance or a plain object. Headers are normalized to a plain object with lowercase names when options are merged, so `init` hooks start with a plain object with lowercase keys. A header removed with `undefined` stays in that object with an `undefined` value.
 
 You can remove a header with `.extend()` by passing the header with an `undefined` value.
 Passing `undefined` as a string removes the header only if it comes from a `Headers` instance.
@@ -997,18 +1040,20 @@ const extended = original.extend({
 	},
 	hooks: {
 		beforeRequest: undefined,
-		afterResponse: [ () => console.log('after 2') ],
+		afterResponse: [
+			({request}) => {
+				console.log('after 2');
+				console.log(request.headers.has('rainbow'));
+				console.log(request.headers.has('unicorn'));
+			}
+		],
 	}
 });
 
-const response = await extended(url);
+await extended(url);
 //=> after 1
 //=> after 2
-
-console.log(response.headers.has('rainbow'));
 //=> false
-
-console.log(response.headers.has('unicorn'));
 //=> true
 ```
 
@@ -1097,8 +1142,7 @@ const response = await ky.post('https://example.com', {
 	}
 });
 
-// Using `.text()` or other body methods is not supported.
-const text = await ky('https://example.com', options).text();
+// Using `.text()` or other body methods is not supported, because there is no response to parse.
 ```
 
 ### ky.retry(options?)
@@ -1106,6 +1150,8 @@ const text = await ky('https://example.com', options).text();
 Force a retry from an `afterResponse` hook.
 
 This allows you to retry a request based on the response content, even if the response has a successful status code. The retry will respect the `retry.limit` option and skip the `shouldRetry` check. The forced retry is observable in `beforeRetry` hooks, where the error will be a `ForceRetryError`.
+
+A marker returned by a second copy of Ky, which happens with a duplicated dependency, is still recognised, the same way the Ky error guards accept branded errors.
 
 #### options
 
@@ -1119,13 +1165,15 @@ Custom delay in milliseconds before retrying. If not provided, uses the default 
 
 **Note:** Custom delays bypass jitter and `backoffLimit`. This is intentional, as custom delays often come from server responses (e.g., `Retry-After` headers) and should be respected exactly as specified.
 
+Must be a non-negative number, `Infinity` included, or `undefined`; anything else makes the request throw a `TypeError` rather than collapsing to a 1ms retry.
+
 ##### code
 
 Type: `string`
 
 Error code for the retry.
 
-This machine-readable identifier will be included in the error message passed to `beforeRetry` hooks, allowing you to distinguish between different types of forced retries.
+This machine-readable identifier will be included in the error message passed to `beforeRetry` hooks, allowing you to distinguish between different types of forced retries. Anything other than a string makes the request throw a `TypeError`.
 
 ```js
 return ky.retry({code: 'RATE_LIMIT'});
@@ -1156,7 +1204,7 @@ Type: `Request`
 
 Custom request to use for the retry.
 
-This allows you to modify or completely replace the request during a forced retry. The custom request becomes the starting point for the retry - `beforeRetry` hooks can still further modify it if needed.
+This allows you to modify or completely replace the request during a forced retry. The custom request becomes the starting point for the retry - `beforeRetry` hooks can still further modify it if needed. Anything other than a `Request` or `undefined` makes the request throw a `TypeError`.
 
 **Note:** The custom request's `signal` will be replaced with Ky's managed signal to handle timeouts and user-provided abort signals correctly. If the original request body has been consumed, you must provide a new body or clone the request before consuming.
 
@@ -1385,6 +1433,8 @@ try {
 ### replaceOption
 
 Wraps a value so that [`ky.extend()`](#kyextenddefaultoptions) will replace the parent value instead of merging with it. Works with hooks, headers, search parameters, context, and any other deep-merged option.
+
+Inside the `json` option, which holds your own data, use it only where it replaces an inherited value. Ky does not look for it anywhere else there. The `context` option is merged shallowly, so only a wrapper around the whole `context` is supported.
 
 ```js
 import ky, {replaceOption} from 'ky';
